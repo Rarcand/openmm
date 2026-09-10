@@ -44,6 +44,7 @@
 #include "openmm/internal/ContextImpl.h"
 #include <condition_variable>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -53,6 +54,7 @@
 namespace OpenMM {
 
 class ExpressionUtilities;
+class ReorderedArraySet;
 class System;
 class ThreadPool;
 
@@ -313,6 +315,30 @@ public:
      * assumes ownership of the object, and deletes it when the context itself is deleted.
      */
     void addReorderListener(ReorderListener* listener);
+    /**
+     * Register an original-ID per-atom array and its spatial destination with the
+     * experimental stable-order nonbonded view. Call during force initialization,
+     * before the backend seals registrations and compiles its fused gather.
+     * Requires a backend configured to use stable original atom IDs.
+     *
+     * Arrays are borrowed: their objects and storage type must remain valid until
+     * this Context is destroyed. Sources need numAtoms elements, destinations
+     * paddedNumAtoms. Padding is owned by the caller and is not gathered. Resizing
+     * the same array object is allowed, but requires invalidateReorderedArrays();
+     * consumers must also refresh their bindings. Replacing an array is forbidden.
+     * No device work is submitted here. Context reinitialization creates a new set.
+     */
+    void addReorderedArray(ArrayInterface& original, ArrayInterface& spatial);
+    /**
+     * Mark registered contents stale after a producer changes original-ID data.
+     * The next default nonbonded parameter gather refreshes all destinations.
+     * This does not immediately gather or synchronize: an independent consumer
+     * must run after that gather, or explicitly produce both orders using the
+     * prepared inverse map. Calls must use the Context's serialized execution.
+     */
+    void invalidateReorderedArrays();
+    /** Backend access for sealing, fused code generation and gather scheduling. */
+    ReorderedArraySet& getReorderedArraySet();
     /**
      * Get the list of ReorderListeners.
      */
@@ -611,6 +637,16 @@ public:
      * up to date.
      */
     void updateGlobalParamValues();
+    /**
+     * Register atoms that must receive the same periodic translation while the
+     * authoritative arrays retain stable atom IDs. Call during force setup.
+     * BondedUtilities registers its interactions automatically. Other consumers
+     * must register any additional coordinate-coupled groups before first use.
+     */
+    void registerRecenterGroup(const std::vector<int>& atoms);
+    int getStepsSinceStableRecenter() const { return stepsSinceStableRecenter; }
+    void setStepsSinceStableRecenter(int value) { stepsSinceStableRecenter = value; }
+    int getStableRecenterCount() const { return stableRecenterCount; }
 protected:
     struct Molecule;
     struct MoleculeGroup;
@@ -640,6 +676,14 @@ protected:
     std::vector<double> lastGlobalParamValues;
     ComputeArray globalParamValues;
     WorkThread* workThread;
+    void recenterStableAtoms();
+    int stepsSinceStableRecenter, stableRecenterCount;
+    std::vector<int> recenterParents, recenterAtomList, recenterStarts;
+    std::vector<mm_int4> recenterShifts;
+    ComputeArray recenterAtoms, recenterRanges, recenterCellShifts;
+    ComputeKernel recenterKernel;
+private:
+    std::unique_ptr<ReorderedArraySet> reorderedArrays;
 };
 
 struct ComputeContext::Molecule {

@@ -63,7 +63,9 @@ void CudaCalcForcesAndEnergyKernel::initialize(const System& system) {
 void CudaCalcForcesAndEnergyKernel::beginComputation(ContextImpl& context, bool includeForces, bool includeEnergy, int groups) {
     cu.setForcesValid(true);
     ContextSelector selector(cu);
+    cu.getNonbondedUtilities().beginPhase("original_force_and_other_autoclear");
     cu.clearAutoclearBuffers();
+    cu.getNonbondedUtilities().endPhase();
     cu.updateGlobalParamValues();
     for (auto computation : cu.getPreComputations())
         computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
@@ -80,8 +82,11 @@ double CudaCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, bo
     cu.getBondedUtilities().computeInteractions(groups);
     cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
     double sum = 0.0;
+    cu.getNonbondedUtilities().beginPhase("post_computations_and_pme_wait");
     for (auto computation : cu.getPostComputations())
         sum += computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
+    cu.getNonbondedUtilities().endPhase();
+    cu.getNonbondedUtilities().finishSpatialForces();
     cu.getIntegrationUtilities().distributeForcesFromVirtualSites();
     if (includeEnergy)
         sum += cu.reduceEnergy();

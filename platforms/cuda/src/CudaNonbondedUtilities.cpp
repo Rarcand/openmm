@@ -27,7 +27,10 @@
 #include "CudaArray.h"
 #include "CudaContext.h"
 #include "CudaKernelSources.h"
+#include "CommonKernelSources.h"
 #include "CudaExpressionUtilities.h"
+#include "CudaSpatialNonbonded.h"
+#include "openmm/common/ContextSelector.h"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -58,7 +61,7 @@ public:
 };
 
 CudaNonbondedUtilities::CudaNonbondedUtilities(CudaContext& context) : context(context), useCutoff(false), usePeriodic(false), useNeighborList(false), anyExclusions(false), usePadding(true),
-        pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), tilesAfterReorder(0) {
+        pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), canOmitExcludedPairs(true), tilesAfterReorder(0) {
     // Decide how many thread blocks to use.
 
     string errorMessage = "Error initializing nonbonded utilities";
@@ -68,7 +71,7 @@ CudaNonbondedUtilities::CudaNonbondedUtilities(CudaContext& context) : context(c
     CHECK_RESULT(cuMemHostAlloc((void**) &pinnedCountBuffer, 2*sizeof(unsigned int), CU_MEMHOSTALLOC_PORTABLE));
     numForceThreadBlocks = 4*multiprocessors;
     forceThreadBlockSize = (context.getComputeCapability() < 2.0 ? 128 : 256);
-    
+
     // When building the neighbor list, we can optionally use large blocks (1024 atoms) to
     // accelerate the process.  This makes building the neighbor list faster, but it prevents
     // us from sorting atom blocks by size, which leads to a slightly less efficient neighbor
@@ -76,16 +79,25 @@ CudaNonbondedUtilities::CudaNonbondedUtilities(CudaContext& context) : context(c
 
     useLargeBlocks = (context.getNumAtoms() > 90000);
     setKernelSource(CudaKernelSources::nonbonded);
+    string mode = context.getPlatformData().propertyValues[CudaPlatform::CudaAtomReordering()];
+    phaseTiming = context.getPlatformData().propertyValues.at("AtomReorderingPhaseTiming") == "true";
+    diagnostics = context.getPlatformData().propertyValues.at("AtomReorderingDiagnostics") == "true";
+    if (mode != "baseline")
+        spatial.reset(new CudaSpatialNonbonded(context, *this, mode == "inverse"));
 }
 
 CudaNonbondedUtilities::~CudaNonbondedUtilities() {
+    for (auto& sample : phaseEvents) {
+        if (sample.start) cuEventDestroy(sample.start);
+        if (sample.end) cuEventDestroy(sample.end);
+    }
     if (pinnedCountBuffer != NULL)
         cuMemFreeHost(pinnedCountBuffer);
     cuEventDestroy(downloadCountEvent);
 }
 
 void CudaNonbondedUtilities::addInteraction(bool usesCutoff, bool usesPeriodic, bool usesExclusions, double cutoffDistance,
-        const vector<vector<int> >& exclusionList, const string& kernel, int forceGroup, bool useNeighborList, bool supportsPairList) {
+        const vector<vector<int> >& exclusionList, const string& kernel, int forceGroup, bool useNeighborList, bool supportsPairList, bool supportsExclusionOmission) {
     if (groupCutoff.size() > 0) {
         if (usesCutoff != useCutoff)
             throw OpenMMException("All Forces must agree on whether to use a cutoff");
@@ -102,6 +114,7 @@ void CudaNonbondedUtilities::addInteraction(bool usesCutoff, bool usesPeriodic, 
     groupCutoff[forceGroup] = cutoffDistance;
     groupFlags |= 1<<forceGroup;
     canUsePairList &= supportsPairList;
+    canOmitExcludedPairs &= supportsExclusionOmission;
     if (kernel.size() > 0) {
         if (groupKernelSource.find(forceGroup) == groupKernelSource.end())
             groupKernelSource[forceGroup] = "";
@@ -122,7 +135,7 @@ void CudaNonbondedUtilities::addArgument(ComputeParameterInfo parameter) {
 
 string CudaNonbondedUtilities::addEnergyParameterDerivative(const string& param) {
     // See if the parameter has already been added.
-    
+
     int index;
     for (index = 0; index < energyParameterDerivatives.size(); index++)
         if (param == energyParameterDerivatives[index])
@@ -159,10 +172,10 @@ static bool compareInt2(int2 a, int2 b) {
 }
 
 void CudaNonbondedUtilities::initialize(const System& system) {
-    string errorMessage = "Error initializing nonbonded utilities";    
+    string errorMessage = "Error initializing nonbonded utilities";
     if (atomExclusions.size() == 0) {
         // No exclusions were specifically requested, so just mark every atom as not interacting with itself.
-        
+
         atomExclusions.resize(context.getNumAtoms());
         for (int i = 0; i < (int) atomExclusions.size(); i++)
             atomExclusions[i].push_back(i);
@@ -192,6 +205,7 @@ void CudaNonbondedUtilities::initialize(const System& system) {
     sort(exclusionTilesVec.begin(), exclusionTilesVec.end(), compareInt2);
     exclusionTiles.initialize<int2>(context, exclusionTilesVec.size(), "exclusionTiles");
     exclusionTiles.upload(exclusionTilesVec);
+    diagnosticExclusionTiles = exclusionTilesVec.size();
     map<pair<int, int>, int> exclusionTileMap;
     for (int i = 0; i < (int) exclusionTilesVec.size(); i++) {
         int2 tile = exclusionTilesVec[i];
@@ -239,7 +253,8 @@ void CudaNonbondedUtilities::initialize(const System& system) {
             }
         }
     }
-    atomExclusions.clear(); // We won't use this again, so free the memory it used
+    if (!spatial)
+        atomExclusions.clear(); // Spatial views retain original-ID exclusions.
     exclusions.upload(exclusionVec);
 
     // Create data structures for the neighbor list.
@@ -265,7 +280,9 @@ void CudaNonbondedUtilities::initialize(const System& system) {
         sortedBlocks.initialize<unsigned int>(context, numAtomBlocks, "sortedBlocks");
         sortedBlockCenter.initialize(context, numAtomBlocks+1, 4*elementSize, "sortedBlockCenter");
         sortedBlockBoundingBox.initialize(context, numAtomBlocks+1, 4*elementSize, "sortedBlockBoundingBox");
-        numBlockSizes = min((context.getNumAtomBlocks()+63)/64, context.getNumThreadBlocks());
+        int boundsTileLanes = (spatial && spatial->gathersInBounds() ? spatial->getBoundsTileLanes() : 1);
+        int tilesPerBoundsBlock = 64/boundsTileLanes;
+        numBlockSizes = min((context.getNumAtomBlocks()+tilesPerBoundsBlock-1)/tilesPerBoundsBlock, context.getNumThreadBlocks());
         blockSizeRange.initialize(context, numBlockSizes, 2*elementSize, "blockSizeRange");
         largeBlockCenter.initialize(context, numAtomBlocks, 4*elementSize, "largeBlockCenter");
         largeBlockBoundingBox.initialize(context, numAtomBlocks, 4*elementSize, "largeBlockBoundingBox");
@@ -368,6 +385,8 @@ void CudaNonbondedUtilities::initialize(const System& system) {
         findInteractingBlocksArgs.push_back(&oldPositions.getDevicePointer());
         findInteractingBlocksArgs.push_back(&rebuildNeighborList.getDevicePointer());
     }
+    if (spatial)
+        spatial->initialize(system);
 }
 
 double CudaNonbondedUtilities::getMaxCutoffDistance() {
@@ -383,8 +402,13 @@ double CudaNonbondedUtilities::padCutoff(double cutoff) {
 }
 
 void CudaNonbondedUtilities::prepareInteractions(int forceGroups) {
+    spatialViewReady = false;
     if ((forceGroups&groupFlags) == 0)
         return;
+    if (spatial) {
+        spatial->prepare();
+        spatialViewReady = true;
+    }
     if (groupKernels.find(forceGroups) == groupKernels.end())
         createKernelsForGroups(forceGroups);
     KernelSet& kernels = groupKernels[forceGroups];
@@ -401,11 +425,14 @@ void CudaNonbondedUtilities::prepareInteractions(int forceGroups) {
 
     // Compute the neighbor list.
 
-    context.executeKernel(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], context.getNumAtomBlocks());
+    beginPhase("neighbor_list");
+    // The allocation above and launch must describe the same number of blocks.
+    context.executeKernel(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], numBlockSizes*64);
     context.executeKernel(kernels.computeSortKeysKernel, &computeSortKeysArgs[0], context.getNumAtomBlocks());
     blockSorter->sort(sortedBlocks);
     context.executeKernel(kernels.sortBoxDataKernel, &sortBoxDataArgs[0], context.getNumAtoms());
     context.executeKernel(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtoms(), 256);
+    endPhase();
     forceRebuildNeighborList = false;
     interactionCount.download(pinnedCountBuffer, false);
     cuEventRecord(downloadCountEvent, context.getCurrentStream());
@@ -413,8 +440,8 @@ void CudaNonbondedUtilities::prepareInteractions(int forceGroups) {
 
 void CudaNonbondedUtilities::initParamArgs() {
     int index = paramStartIndex;
-    for (ComputeParameterInfo& param : parameters)
-        forceArgs[index++] = &context.unwrap(param.getArray()).getDevicePointer();
+    for (int i = 0; i < parameters.size(); i++)
+        forceArgs[index++] = &(spatial ? spatial->parameters[i]->getDevicePointer() : context.unwrap(parameters[i].getArray()).getDevicePointer());
     for (ComputeParameterInfo& arg : arguments)
         forceArgs[index++] = &context.unwrap(arg.getArray()).getDevicePointer();
     hasInitializedParams = true;
@@ -430,7 +457,13 @@ void CudaNonbondedUtilities::computeInteractions(int forceGroups, bool includeFo
             kernel = createInteractionKernel(kernels.source, parameters, arguments, true, true, forceGroups, includeForces, includeEnergy);
         if (!hasInitializedParams)
             initParamArgs();
+        if (spatial) {
+            getSpatialWorkView(includeForces);
+        }
+        beginPhase("nonbonded_direct");
         context.executeKernel(kernel, &forceArgs[0], numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
+        endPhase();
+
     }
     if (useNeighborList && numTiles > 0) {
         cuEventSynchronize(downloadCountEvent);
@@ -441,10 +474,22 @@ void CudaNonbondedUtilities::computeInteractions(int forceGroups, bool includeFo
 bool CudaNonbondedUtilities::updateNeighborListSize() {
     if (!useCutoff)
         return false;
-    if (context.getStepsSinceReorder() == 0 || tilesAfterReorder == 0)
-        tilesAfterReorder = pinnedCountBuffer[0];
-    else if (context.getStepsSinceReorder() > 25 && pinnedCountBuffer[0] > 1.1*tilesAfterReorder)
-        context.forceReorder();
+    if (diagnostics) {
+        diagnosticEvaluations++;
+        diagnosticTiles += pinnedCountBuffer[0];
+        diagnosticPairs += pinnedCountBuffer[1];
+        diagnosticExclusions += diagnosticExclusionTiles;
+    }
+    if (!spatial) {
+        if (context.getStepsSinceReorder() == 0 || tilesAfterReorder == 0)
+            tilesAfterReorder = pinnedCountBuffer[0];
+        else if (context.getStepsSinceReorder() > 25 && pinnedCountBuffer[0] > 1.1*tilesAfterReorder) {
+            if (spatial)
+                spatial->requestReorder();
+            else
+                context.forceReorder();
+        }
+    }
     if (pinnedCountBuffer[0] <= maxTiles && pinnedCountBuffer[1] <= maxSinglePairs)
         return false;
 
@@ -476,6 +521,31 @@ bool CudaNonbondedUtilities::updateNeighborListSize() {
     forceRebuildNeighborList = true;
     context.setForcesValid(false);
     return true;
+}
+
+const string& CudaNonbondedUtilities::getReorderingStatistics() {
+    ContextSelector selector(context);
+    collectPhaseTimes();
+    stringstream out;
+    out << "{\"enabled\":" << (diagnostics ? "true" : "false")
+        << ",\"evaluations\":" << diagnosticEvaluations
+        << ",\"candidate_tiles_total\":" << diagnosticTiles
+        << ",\"single_pairs_total\":" << diagnosticPairs
+        << ",\"exclusion_tiles_total\":" << diagnosticExclusions
+        << ",\"last_exclusion_tiles\":" << diagnosticExclusionTiles
+        << ",\"spatial_reorders\":" << (spatial ? spatial->getReorderCount() : 0)
+        << ",\"stable_recenters\":" << context.getStableRecenterCount()
+        << ",\"phase_timing\":" << (phaseTiming ? "true" : "false") << ",\"phases\":{";
+    bool first = true;
+    for (const auto& phase : phaseTotals) {
+        if (!first) out << ",";
+        first = false;
+        out << "\"" << phase.first << "\":{\"milliseconds\":" << phase.second.first
+            << ",\"calls\":" << phase.second.second << "}";
+    }
+    out << "}}";
+    diagnosticReport = out.str();
+    return diagnosticReport;
 }
 
 void CudaNonbondedUtilities::setUsePadding(bool padding) {
@@ -520,13 +590,20 @@ void CudaNonbondedUtilities::createKernelsForGroups(int groups) {
         if (useLargeBlocks)
             defines["USE_LARGE_BLOCKS"] = "1";
         defines["MAX_EXCLUSIONS"] = context.intToString(maxExclusions);
+        if (spatial) defines["SPATIAL_ATOM_ORDER"] = "1";
+        if (spatial && spatial->gathersInBounds()) {
+            defines["GATHER_SPATIAL_BOUNDS"] = "1";
+            defines["BOUNDS_TILE_LANES"] = context.intToString(spatial->getBoundsTileLanes());
+            defines["CLEAR_SPATIAL_FORCES"] = "1";
+        }
         defines["MAX_BITS_FOR_PAIRS"] = (canUsePairList ? (context.getComputeCapability() < 8.0 ? "2" : "3") : "0");
         int binShift = 1;
         while (1<<binShift <= context.getNumAtomBlocks())
             binShift++;
         defines["BIN_SHIFT"] = context.intToString(binShift);
         defines["BLOCK_INDEX_MASK"] = context.intToString((1<<binShift)-1);
-        CUmodule interactingBlocksProgram = context.createModule(CudaKernelSources::vectorOps+CudaKernelSources::findInteractingBlocks, defines);
+        string neighborSource = CudaKernelSources::vectorOps+CudaKernelSources::findInteractingBlocks;
+        CUmodule interactingBlocksProgram = context.createModule(neighborSource, defines);
         kernels.findBlockBoundsKernel = context.getKernel(interactingBlocksProgram, "findBlockBounds");
         kernels.computeSortKeysKernel = context.getKernel(interactingBlocksProgram, "computeSortKeys");
         kernels.sortBoxDataKernel = context.getKernel(interactingBlocksProgram, "sortBoxData");
@@ -537,7 +614,6 @@ void CudaNonbondedUtilities::createKernelsForGroups(int groups) {
 
 CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source, vector<ComputeParameterInfo>& params, vector<ComputeParameterInfo>& arguments, bool useExclusions, bool isSymmetric, int groups, bool includeForces, bool includeEnergy) {
     map<string, string> replacements;
-    replacements["COMPUTE_INTERACTION"] = source;
     const string suffixes[] = {"x", "y", "z", "w"};
     stringstream localData;
     int localDataSize = 0;
@@ -570,6 +646,8 @@ CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source,
     }
     if (energyParameterDerivatives.size() > 0)
         args << ", mixed* __restrict__ energyParamDerivs";
+    if (spatial)
+        args << ", const int* spatialExclusionCount";
     replacements["PARAMETER_ARGUMENTS"] = args.str();
 
     stringstream load1;
@@ -600,8 +678,8 @@ CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source,
         }
     }
     replacements["BROADCAST_WARP_DATA"] = broadcastWarpData.str();
-    
-    // Part 2. Defines for off-diagonal exclusions, and neighborlist tiles. 
+
+    // Part 2. Defines for off-diagonal exclusions, and neighborlist tiles.
     stringstream declareLocal2;
     for (const ComputeParameterInfo& param : params)
         declareLocal2<<param.getType()<<" shfl"<<param.getName()<<";\n";
@@ -611,7 +689,7 @@ CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source,
     for (const ComputeParameterInfo& param : params)
         loadLocal2<<"shfl"<<param.getName()<<" = global_"<<param.getName()<<"[j];\n";
     replacements["LOAD_LOCAL_PARAMETERS_FROM_GLOBAL"] = loadLocal2.str();
-   
+
     stringstream load2j;
     for (const ComputeParameterInfo& param : params)
         load2j<<param.getType()<<" "<<param.getName()<<"2 = shfl"<<param.getName()<<";\n";
@@ -621,7 +699,7 @@ CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source,
     for (const ComputeParameterInfo& param : params)
         load2g<<param.getType()<<" "<<param.getName()<<"2 = global_"<<param.getName()<<"[atom2];\n";
     replacements["LOAD_ATOM2_PARAMETERS_FROM_GLOBAL"] = load2g.str();
-    
+
     stringstream clearLocal;
     for (const ComputeParameterInfo& param : params) {
         clearLocal<<"shfl"<<param.getName()<<" = ";
@@ -667,6 +745,9 @@ CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source,
         }
     }
     replacements["SHUFFLE_WARP_DATA"] = shuffleWarpData.str();
+    map<string, string> subtileShuffle;
+    subtileShuffle["tgx+1"] = "((tgx & ~7u) | ((tgx+1) & 7u))";
+    replacements["SHUFFLE_EXCLUSION_SUBTILE_DATA"] = context.replaceStrings(shuffleWarpData.str(), subtileShuffle);
 
     map<string, string> defines;
     if (useCutoff)
@@ -675,10 +756,19 @@ CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source,
         defines["USE_PERIODIC"] = "1";
     if (useExclusions)
         defines["USE_EXCLUSIONS"] = "1";
+    // Arbitrary spatial reordering can create off-diagonal tiles later.
+    addArithmeticGuardSources(source, kernelSource,
+            context.getPlatformData().propertyValues.at("NonbondedArithmeticGuard"), replacements, defines);
+
     if (isSymmetric)
         defines["USE_SYMMETRIC"] = "1";
     if (useNeighborList)
         defines["USE_NEIGHBOR_LIST"] = "1";
+    // Reuse the ordinary tile's conservative periodic-copy criterion for
+    // exclusion tiles. It needs the current block bounds from a neighbor list.
+    if (spatial && usePeriodic && useNeighborList)
+        defines["EXCLUSION_LOCALITY"] = "1";
+
     defines["ENABLE_SHUFFLE"] = "1";
     if (includeForces)
         defines["INCLUDE_FORCES"] = "1";
@@ -706,13 +796,101 @@ CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source,
     int endExclusionIndex = (context.getContextIndex()+1)*numExclusionTiles/numContexts;
     defines["FIRST_EXCLUSION_TILE"] = context.intToString(startExclusionIndex);
     defines["LAST_EXCLUSION_TILE"] = context.intToString(endExclusionIndex);
+    if (spatial) {
+        defines["NUM_TILES_WITH_EXCLUSIONS"] = "spatialExclusionCount[0]";
+        defines["FIRST_EXCLUSION_TILE"] = "0";
+        defines["LAST_EXCLUSION_TILE"] = "spatialExclusionCount[0]";
+    }
     if ((localDataSize/4)%2 == 0 && !context.getUseDoublePrecision())
         defines["PARAMETER_SIZE_IS_EVEN"] = "1";
-    CUmodule program = context.createModule(CudaKernelSources::vectorOps+context.replaceStrings(kernelSource, replacements), defines);
+    string kernelTemplate = kernelSource;
+
+    CUmodule program = context.createModule(CudaKernelSources::vectorOps+context.replaceStrings(kernelTemplate, replacements), defines);
     CUfunction kernel = context.getKernel(program, "computeNonbonded");
     return kernel;
 }
 
 void CudaNonbondedUtilities::setKernelSource(const string& source) {
     kernelSource = source;
+}
+
+void CudaNonbondedUtilities::finishSpatialForces() {
+    spatialViewReady = false;
+    if (spatial)
+        spatial->mergeForces();
+}
+
+ArrayInterface* CudaNonbondedUtilities::getInverseSpatialAtomOrder() {
+    return spatial && spatial->getReorderCount() > 0 ? &spatial->getInverseAtomOrder() : nullptr;
+}
+
+ArrayInterface* CudaNonbondedUtilities::getReorderedParameterArray(ArrayInterface& original) {
+    if (!spatial || spatial->getReorderCount() == 0)
+        return nullptr;
+    if (!original.isInitialized() || &original.getContext() != &context)
+        throw OpenMMException("Spatial parameter source must belong to this ComputeContext");
+    for (const auto& entry : context.getReorderedArraySet().getEntries())
+        if (&context.unwrap(original) == entry.original)
+            return entry.sorted;
+    return nullptr;
+}
+
+void CudaNonbondedUtilities::invalidateSpatialParameters() {
+    if (spatial)
+        spatial->invalidateParameters();
+}
+
+// Diagnostic stream elapsed times. Reuse a bounded event pool and read it only
+// at explicit statistics requests or when full. Normal timing runs disable this.
+static void checkPhaseEvent(CUresult result) {
+    if (result != CUDA_SUCCESS)
+        throw OpenMMException("CUDA phase timer: "+CudaContext::getErrorString(result));
+}
+
+void CudaNonbondedUtilities::beginPhase(const char* name) {
+    if (!phaseTiming) return;
+    if (phaseEvents.empty()) {
+        phaseEvents.resize(8192);
+        for (auto& sample : phaseEvents) {
+            checkPhaseEvent(cuEventCreate(&sample.start, CU_EVENT_DEFAULT));
+            checkPhaseEvent(cuEventCreate(&sample.end, CU_EVENT_DEFAULT));
+        }
+    }
+    if (pendingPhaseEvents == phaseEvents.size()) collectPhaseTimes();
+    auto& sample = phaseEvents[pendingPhaseEvents];
+    sample.name = name;
+    checkPhaseEvent(cuEventRecord(sample.start, context.getCurrentStream()));
+}
+
+void CudaNonbondedUtilities::endPhase() {
+    if (!phaseTiming) return;
+    checkPhaseEvent(cuEventRecord(phaseEvents[pendingPhaseEvents].end, context.getCurrentStream()));
+    pendingPhaseEvents++;
+}
+
+void CudaNonbondedUtilities::collectPhaseTimes() {
+    if (!pendingPhaseEvents) return;
+    checkPhaseEvent(cuEventSynchronize(phaseEvents[pendingPhaseEvents-1].end));
+    for (int i = 0; i < pendingPhaseEvents; i++) {
+        auto& sample = phaseEvents[i];
+        float milliseconds;
+        checkPhaseEvent(cuEventElapsedTime(&milliseconds, sample.start, sample.end));
+        phaseTotals[sample.name].first += milliseconds;
+        phaseTotals[sample.name].second++;
+    }
+    pendingPhaseEvents = 0;
+}
+
+SpatialNonbondedView CudaNonbondedUtilities::getSpatialWorkView(bool includeForces) {
+    if (!spatial || !spatialViewReady)
+        throw OpenMMException("Spatial work is only available during an active nonbonded evaluation");
+    spatial->gatherParameters(includeForces);
+    return {&spatial->positions, &spatial->forces,
+        &spatial->getAtomOrder(), &spatial->getInverseAtomOrder(),
+        &exclusionTiles, &exclusions, &spatial->exclusionCount,
+        &exclusionRowIndices, &exclusionIndices,
+        useNeighborList ? &interactingTiles : nullptr,
+        useNeighborList ? &interactingAtoms : nullptr,
+        useNeighborList ? &interactionCount : nullptr, useNeighborList ? &singlePairs : nullptr,
+        context.getNumAtoms(), context.getPaddedNumAtoms(), spatial->getReorderCount(), useNeighborList};
 }

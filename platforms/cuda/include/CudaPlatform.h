@@ -48,6 +48,11 @@ public:
     }
     double getSpeed() const;
     bool supportsDoublePrecision() const;
+    /** Experimental CUDA spatial view: baseline, proposal (scatter), or inverse (gather). */
+    static const std::string& CudaAtomReordering() {
+        static const std::string key = "AtomReordering";
+        return key;
+    }
     const std::string& getPropertyValue(const Context& context, const std::string& property) const;
     void setPropertyValue(Context& context, const std::string& property, const std::string& value) const;
     std::vector<std::map<std::string, std::string> > getDevices(const std::map<std::string, std::string>& filters={}) const;
@@ -133,8 +138,8 @@ public:
 class OPENMM_EXPORT_COMMON CudaPlatform::PlatformData {
 public:
     PlatformData(ContextImpl* context, const System& system, const std::string& deviceIndexProperty, const std::string& blockingProperty, const std::string& precisionProperty,
-            const std::string& cpuPmeProperty, const std::string& tempProperty, const std::string& pmeStreamProperty, const std::string& deterministicForcesProperty,
-            int numThreads, ContextImpl* originalContext);
+            const std::string& cpuPmeProperty, const std::string& tempProperty, const std::string& pmeStreamProperty, const std::string& deterministicForcesProperty, const std::string& atomReorderingProperty,
+            int numThreads, ContextImpl* originalContext, const std::map<std::string, std::string>& spatialProperties);
     ~PlatformData();
     void initializeContexts(const System& system);
     void syncContexts();

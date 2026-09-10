@@ -77,7 +77,8 @@ double OpenCLCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, 
     double sum = 0.0;
     for (auto computation : cl.getPostComputations())
         sum += computation->computeForceAndEnergy(includeForces, includeEnergy, groups);
-    cl.reduceForces();
+    if (!cl.getNonbondedUtilities().finishSpatialForces())
+        cl.reduceForces();
     cl.getIntegrationUtilities().distributeForcesFromVirtualSites();
     if (includeEnergy)
         sum += cl.reduceEnergy();

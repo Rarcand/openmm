@@ -43,7 +43,7 @@ namespace OpenMM {
 class CommonCalcCustomNonbondedForceKernel : public CalcCustomNonbondedForceKernel {
 public:
     CommonCalcCustomNonbondedForceKernel(std::string name, const Platform& platform, ComputeContext& cc, const System& system) : CalcCustomNonbondedForceKernel(name, platform),
-            cc(cc), params(NULL), computedValues(NULL), forceCopy(NULL), system(system), hasInitializedKernel(false) {
+            cc(cc), params(NULL), computedValues(NULL), forceCopy(NULL), system(system), hasInitializedKernel(false), hasInitializedComputedValuesKernel(false), computesSortedValues(false) {
     }
     ~CommonCalcCustomNonbondedForceKernel();
     /**
@@ -82,6 +82,7 @@ private:
     ComputeParameterSet* computedValues;
     ComputeArray interactionGroupData, filteredGroupData, numGroupTiles;
     ComputeKernel interactionGroupKernel, prepareNeighborListKernel, buildNeighborListKernel, computedValuesKernel;
+    std::string spatialComputedValuesSource;
     std::vector<void*> interactionGroupArgs;
     std::vector<std::string> globalParamNames;
     std::vector<float> globalParamValues;
@@ -94,6 +95,7 @@ private:
     std::map<std::vector<float>, std::vector<double> > longRangeCoefficientDerivsCache;
     std::vector<double> longRangeCoefficientDerivs;
     bool hasInitializedLongRangeCorrection, hasInitializedKernel, hasParamDerivs, useNeighborList, needGlobalParams;
+    bool hasInitializedComputedValuesKernel, computesSortedValues;
     int numGroupThreadBlocks;
     CustomNonbondedForce* forceCopy;
     CustomNonbondedForceImpl::LongRangeCorrectionData longRangeCorrectionData;

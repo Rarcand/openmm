@@ -44,6 +44,19 @@ __kernel void computeNonbonded(
         unsigned int atom1 = x*TILE_SIZE + tgx;
         real4 posq1 = posq[atom1];
         LOAD_ATOM1_PARAMETERS
+#ifdef EXCLUSION_LOCALITY
+        // Use the same geometric condition as ordinary neighbor tiles.  Every
+        // interaction inside MAX_CUTOFF has the same image in this frame.
+        // Noncompact blocks retain per-pair minimum-image calculations.
+        const real4 exclusionCenter = blockCenter[x];
+        const real4 exclusionSize = blockSize[x];
+        const bool localExclusion = (0.5f*periodicBoxSize.x-exclusionSize.x >= MAX_CUTOFF &&
+                                     0.5f*periodicBoxSize.y-exclusionSize.y >= MAX_CUTOFF &&
+                                     0.5f*periodicBoxSize.z-exclusionSize.z >= MAX_CUTOFF);
+        if (localExclusion) {
+            APPLY_PERIODIC_TO_POS_WITH_CENTER(posq1, exclusionCenter)
+        }
+#endif
 #ifdef USE_EXCLUSIONS
         unsigned int excl = exclusions[pos*TILE_SIZE+tgx];
 #endif
@@ -62,7 +75,13 @@ __kernel void computeNonbonded(
                 real4 posq2 = (real4) (localData[atom2].x, localData[atom2].y, localData[atom2].z, localData[atom2].q);
                 real4 delta = (real4) (posq2.xyz - posq1.xyz, 0);
 #ifdef USE_PERIODIC
+#ifdef EXCLUSION_LOCALITY
+                if (!localExclusion) {
+                    APPLY_PERIODIC_TO_DELTA(delta)
+                }
+#else
                 APPLY_PERIODIC_TO_DELTA(delta)
+#endif
 #endif
                 real r2 = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z;
                 real invR = RSQRT(r2);
@@ -80,7 +99,7 @@ __kernel void computeNonbonded(
 #endif
                 real tempEnergy = 0;
                 const real interactionScale = 0.5f;
-                COMPUTE_INTERACTION
+                COMPUTE_EXCLUSION_INTERACTION
                 energy += 0.5f*tempEnergy;
 #ifdef INCLUDE_FORCES
 #ifdef USE_SYMMETRIC
@@ -100,6 +119,11 @@ __kernel void computeNonbonded(
 
             unsigned int j = y*TILE_SIZE + tgx;
             real4 tempPosq = posq[j];
+#ifdef EXCLUSION_LOCALITY
+            if (localExclusion) {
+                APPLY_PERIODIC_TO_POS_WITH_CENTER(tempPosq, exclusionCenter)
+            }
+#endif
             localData[localAtomIndex].x = tempPosq.x;
             localData[localAtomIndex].y = tempPosq.y;
             localData[localAtomIndex].z = tempPosq.z;
@@ -118,7 +142,13 @@ __kernel void computeNonbonded(
                 real4 posq2 = (real4) (localData[atom2].x, localData[atom2].y, localData[atom2].z, localData[atom2].q);
                 real4 delta = (real4) (posq2.xyz - posq1.xyz, 0);
 #ifdef USE_PERIODIC
+#ifdef EXCLUSION_LOCALITY
+                if (!localExclusion) {
+                    APPLY_PERIODIC_TO_DELTA(delta)
+                }
+#else
                 APPLY_PERIODIC_TO_DELTA(delta)
+#endif
 #endif
                 real r2 = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z;
 #ifdef PRUNE_BY_CUTOFF
@@ -139,7 +169,7 @@ __kernel void computeNonbonded(
 #endif
                     real tempEnergy = 0;
                     const real interactionScale = 1.0f;
-                    COMPUTE_INTERACTION
+                    COMPUTE_EXCLUSION_INTERACTION
                     energy += tempEnergy;
 #ifdef INCLUDE_FORCES
 #ifdef USE_SYMMETRIC

@@ -38,6 +38,7 @@
 namespace OpenMM {
     
 class CudaContext;
+class CudaSpatialNonbonded;
 
 /**
  * This class provides a generic interface for calculating nonbonded interactions.  It does this in two
@@ -66,8 +67,25 @@ class CudaContext;
 
 class OPENMM_EXPORT_COMMON CudaNonbondedUtilities : public NonbondedUtilities  {
 public:
+    void beginPhase(const char* name);
+    void endPhase();
+    bool getMeasureReorderTime() const { return phaseTiming; }
+    void recordReorderTime(double milliseconds) {
+        phaseTotals["legacy_reorder_cpu_wall"].first += milliseconds;
+        phaseTotals["legacy_reorder_cpu_wall"].second++;
+    }
+    void recordStableRecenterTime(double milliseconds) {
+        phaseTotals["stable_recenter_cpu_wall"].first += milliseconds;
+        phaseTotals["stable_recenter_cpu_wall"].second++;
+    }
     CudaNonbondedUtilities(CudaContext& context);
     ~CudaNonbondedUtilities();
+    void finishSpatialForces();
+    void invalidateSpatialParameters();
+    ArrayInterface* getInverseSpatialAtomOrder() override;
+    ArrayInterface* getReorderedParameterArray(ArrayInterface& original) override;
+    SpatialNonbondedView getSpatialWorkView(bool includeForces) override;
+    bool getUsesStableAtomOrder() const { return spatial.get() != NULL; }
     /**
      * Add a nonbonded interaction to be evaluated by the default interaction kernel.
      *
@@ -80,11 +98,13 @@ public:
      * @param forceGroup       the force group in which the interaction should be calculated
      * @param useNeighborList  specifies whether a neighbor list should be used to optimize this interaction.  This should
      *                         be viewed as only a suggestion.  Even when it is false, a neighbor list may be used anyway.
+     * @param supportsExclusionOmission true only if excluded pairs require no calculation in this kernel.
+     *        Every consumer must opt in before a backend may omit them during neighbor construction.
      * @param supportsPairList specifies whether this interaction can work with a neighbor list that uses a separate pair list
      */
     void addInteraction(bool usesCutoff, bool usesPeriodic, bool usesExclusions, double cutoffDistance,
                         const std::vector<std::vector<int> >& exclusionList, const std::string& kernel,
-                        int forceGroup, bool useNeighborList=true, bool supportsPairList=false);
+                        int forceGroup, bool useNeighborList=true, bool supportsPairList=false, bool supportsExclusionOmission=false);
     /**
      * Add a per-atom parameter that the default interaction kernel may depend on.
      */
@@ -161,6 +181,10 @@ public:
      * Prepare to compute interactions.  This updates the neighbor list.
      */
     void prepareInteractions(int forceGroups);
+    /** Experimental counters. Enable AtomReorderingDiagnostics when creating the Context.
+     * Tile totals count neighbor-list entries over evaluations, not accepted atom pairs.
+     */
+    const std::string& getReorderingStatistics();
     /**
      * Compute the nonbonded interactions.
      * 
@@ -293,6 +317,19 @@ public:
      */
     void setKernelSource(const std::string& source);
 private:
+    friend class CudaSpatialNonbonded;
+    friend class CudaReorderingDiagnostic;
+    std::unique_ptr<CudaSpatialNonbonded> spatial;
+    bool diagnostics;
+    int diagnosticExclusionTiles = 0;
+    long long diagnosticEvaluations = 0, diagnosticTiles = 0, diagnosticPairs = 0, diagnosticExclusions = 0;
+    std::string diagnosticReport;
+    bool phaseTiming = false;
+    struct PhaseEvents { CUevent start = NULL, end = NULL; std::string name; };
+    std::vector<PhaseEvents> phaseEvents;
+    int pendingPhaseEvents = 0;
+    std::map<std::string, std::pair<double, long long> > phaseTotals;
+    void collectPhaseTimes();
     class KernelSet;
     class BlockSortTrait;
     void initParamArgs();
@@ -320,6 +357,7 @@ private:
     ComputeSort blockSorter;
     CUevent downloadCountEvent;
     unsigned int* pinnedCountBuffer;
+    bool spatialViewReady = false;
     std::vector<void*> forceArgs, findBlockBoundsArgs, computeSortKeysArgs, sortBoxDataArgs, findInteractingBlocksArgs;
     std::vector<std::vector<int> > atomExclusions;
     std::vector<ComputeParameterInfo> parameters;
@@ -328,7 +366,7 @@ private:
     std::map<int, double> groupCutoff;
     std::map<int, std::string> groupKernelSource;
     double maxCutoff;
-    bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, canUsePairList, useLargeBlocks, hasInitializedParams;
+    bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, canUsePairList, canOmitExcludedPairs, useLargeBlocks, hasInitializedParams;
     int startTileIndex, startBlockIndex, numBlocks, maxExclusions, numForceThreadBlocks, forceThreadBlockSize, numAtoms, groupFlags, numBlockSizes, paramStartIndex;
     unsigned int maxTiles, maxSinglePairs, tilesAfterReorder;
     long long numTiles;

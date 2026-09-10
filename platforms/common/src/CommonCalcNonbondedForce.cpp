@@ -280,6 +280,11 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
         exclusionList[exclusion.first].push_back(exclusion.second);
         exclusionList[exclusion.second].push_back(exclusion.first);
     }
+    // Include zero-valued exceptions: offsets or parameter updates can activate
+    // their separate, potentially nonperiodic pair calculation later.
+    if (cc.getNonbondedUtilities().getUsesStableAtomOrder())
+        for (const auto& group : exclusionList)
+            cc.registerRecenterGroup(group);
     nonbondedMethod = CalcNonbondedForceKernel::NonbondedMethod(force.getNonbondedMethod());
     bool useCutoff = (nonbondedMethod != NoCutoff);
     bool usePeriodic = (nonbondedMethod != NoCutoff && nonbondedMethod != CutoffNonPeriodic);
@@ -619,7 +624,7 @@ void CommonCalcNonbondedForceKernel::commonInitialize(const System& system, cons
     }
     source = cc.replaceStrings(source, replacements);
     if (force.getIncludeDirectSpace())
-        cc.getNonbondedUtilities().addInteraction(useCutoff, usePeriodic, true, force.getCutoffDistance(), exclusionList, source, force.getForceGroup(), numParticles > 3000, true);
+        cc.getNonbondedUtilities().addInteraction(useCutoff, usePeriodic, true, force.getCutoffDistance(), exclusionList, source, force.getForceGroup(), numParticles > 3000, true, true);
 
     // Initialize the exceptions.
 
@@ -899,6 +904,7 @@ double CommonCalcNonbondedForceKernel::execute(ContextImpl& context, bool includ
     if (recomputeParams || hasOffsets) {
         computeParamsKernel->setArg(1, (int) (includeEnergy && includeReciprocal));
         computeParamsKernel->execute(cc.getNumAtoms());
+        cc.getNonbondedUtilities().invalidateSpatialParameters();
         if (exclusionParams.isInitialized())
             computeExclusionParamsKernel->execute(exclusionParams.getSize());
         if (usePmeQueue) {

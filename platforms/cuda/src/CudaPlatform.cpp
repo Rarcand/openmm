@@ -1,3 +1,4 @@
+#include "openmm/common/SpatialNonbondedPolicy.h"
 /* -------------------------------------------------------------------------- *
  *                                   OpenMM                                   *
  * -------------------------------------------------------------------------- *
@@ -25,6 +26,7 @@
 #include "CudaContext.h"
 #include "CudaExpressionUtilities.h"
 #include "CudaPlatform.h"
+#include "CudaNonbondedUtilities.h"
 #include "CudaKernelFactory.h"
 #include "CudaKernels.h"
 #include "openmm/Context.h"
@@ -40,6 +42,13 @@
 #endif
 using namespace OpenMM;
 using namespace std;
+
+// Internal settings for the fixed full-tile prototype.
+static const map<string, string> spatialDefaults = {
+    {"AtomReorderingDiagnostics", "false"}, {"AtomReorderingPhaseTiming", "false"},
+    {"AtomReorderingExclusionLocality", "true"},
+    {"NonbondedArithmeticGuard", "false"}
+};
 
 #define CHECK_RESULT(result, prefix) \
     if (result != CUDA_SUCCESS) { \
@@ -117,6 +126,9 @@ CudaPlatform::CudaPlatform() {
     platformProperties.push_back(CudaDeviceName());
     platformProperties.push_back(CudaUseBlockingSync());
     platformProperties.push_back(CudaPrecision());
+    platformProperties.push_back("AtomReorderingStatus");
+    platformProperties.push_back(CudaAtomReordering());
+    setPropertyDefaultValue(CudaAtomReordering(), "baseline");
     platformProperties.push_back(CudaUseCpuPme());
     platformProperties.push_back(CudaCompiler());
     platformProperties.push_back(CudaTempDirectory());
@@ -152,6 +164,8 @@ bool CudaPlatform::supportsDoublePrecision() const {
 const string& CudaPlatform::getPropertyValue(const Context& context, const string& property) const {
     const ContextImpl& impl = getContextImpl(context);
     const PlatformData* data = reinterpret_cast<const PlatformData*>(impl.getPlatformData());
+    if (property == "AtomReorderingStatistics")
+        return data->contexts[0]->getNonbondedUtilities().getReorderingStatistics();
     string propertyName = property;
     if (deprecatedPropertyReplacements.find(property) != deprecatedPropertyReplacements.end())
         propertyName = deprecatedPropertyReplacements.find(property)->second;
@@ -234,8 +248,12 @@ void CudaPlatform::contextCreated(ContextImpl& context, const map<string, string
     char* threadsEnv = getenv("OPENMM_CPU_THREADS");
     if (threadsEnv != NULL)
         stringstream(threadsEnv) >> threads;
+    string reorder = properties.count(CudaAtomReordering()) ? properties.at(CudaAtomReordering()) : getPropertyDefaultValue(CudaAtomReordering());
+    if (reorder != "baseline" && reorder != "inverse" && reorder != "auto")
+        throw OpenMMException("AtomReordering must be baseline, inverse, or auto");
+    map<string, string> spatialProperties = spatialDefaults;
     context.setPlatformData(new PlatformData(&context, context.getSystem(), devicePropValue, blockingPropValue, precisionPropValue, cpuPmePropValue, tempPropValue,
-            pmeStreamPropValue, deterministicForcesValue, threads, NULL));
+            pmeStreamPropValue, deterministicForcesValue, reorder, threads, NULL, spatialProperties));
 }
 
 void CudaPlatform::linkedContextCreated(ContextImpl& context, ContextImpl& originalContext) const {
@@ -248,8 +266,11 @@ void CudaPlatform::linkedContextCreated(ContextImpl& context, ContextImpl& origi
     string pmeStreamPropValue = platform.getPropertyValue(originalContext.getOwner(), CudaDisablePmeStream());
     string deterministicForcesValue = platform.getPropertyValue(originalContext.getOwner(), CudaDeterministicForces());
     int threads = reinterpret_cast<PlatformData*>(originalContext.getPlatformData())->threads.getNumThreads();
+    map<string, string> spatialProperties;
+    for (const auto& property : spatialDefaults)
+        spatialProperties[property.first] = platform.getPropertyValue(originalContext.getOwner(), property.first);
     context.setPlatformData(new PlatformData(&context, context.getSystem(), devicePropValue, blockingPropValue, precisionPropValue, cpuPmePropValue, tempPropValue,
-            pmeStreamPropValue, deterministicForcesValue, threads, &originalContext));
+            pmeStreamPropValue, deterministicForcesValue, platform.getPropertyValue(originalContext.getOwner(), CudaAtomReordering()), threads, &originalContext, spatialProperties));
 }
 
 void CudaPlatform::contextDestroyed(ContextImpl& context) const {
@@ -258,9 +279,11 @@ void CudaPlatform::contextDestroyed(ContextImpl& context) const {
 }
 
 CudaPlatform::PlatformData::PlatformData(ContextImpl* context, const System& system, const string& deviceIndexProperty, const string& blockingProperty, const string& precisionProperty,
-            const string& cpuPmeProperty, const string& tempProperty, const string& pmeStreamProperty, const string& deterministicForcesProperty,
-            int numThreads, ContextImpl* originalContext) : context(context), removeCM(false), stepCount(0), computeForceCount(0), time(0.0),
+            const string& cpuPmeProperty, const string& tempProperty, const string& pmeStreamProperty, const string& deterministicForcesProperty, const string& atomReorderingProperty,
+            int numThreads, ContextImpl* originalContext, const map<string, string>& spatialProperties) : context(context), removeCM(false), stepCount(0), computeForceCount(0), time(0.0),
                 hasInitializedContexts(false), threads(numThreads) {
+    propertyValues[CudaPlatform::CudaAtomReordering()] = atomReorderingProperty;
+    propertyValues.insert(spatialProperties.begin(), spatialProperties.end());
     bool blocking = (blockingProperty == "true");
     vector<string> devices;
     size_t searchPos = 0, nextPos;
@@ -269,6 +292,9 @@ CudaPlatform::PlatformData::PlatformData(ContextImpl* context, const System& sys
         searchPos = nextPos+1;
     }
     devices.push_back(deviceIndexProperty.substr(searchPos));
+    int selectedDevices = 0;
+    for (const auto& device : devices) if (!device.empty()) selectedDevices++;
+    SpatialNonbondedPolicy::configure(propertyValues, system, max(1, selectedDevices));
     PlatformData* originalData = NULL;
     if (originalContext != NULL)
         originalData = reinterpret_cast<PlatformData*>(originalContext->getPlatformData());

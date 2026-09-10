@@ -1,16 +1,41 @@
+// Spatial ordering can create adjacency rows longer than the local cache.
+#ifdef SPATIAL_ATOM_ORDER
+#define EXCLUSION_FOR_X(k) ((k) < MAX_EXCLUSIONS ? exclusionsForX[k] : exclusionIndices[exclusionStart+(k)])
+#else
+#define EXCLUSION_FOR_X(k) exclusionsForX[k]
+#endif
+
 #pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable
 #pragma OPENCL EXTENSION cl_khr_byte_addressable_store : enable
+
+#ifdef SPATIAL_GATHER_BOUNDS
+#define BOUNDS_POS_CONST
+#else
+#define BOUNDS_POS_CONST const
+#endif
 
 /**
  * Find a bounding box for the atoms in each block.
  */
 __kernel void findBlockBounds(int numAtoms, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
-        __global const real4* restrict posq, __global real4* restrict blockCenter, __global real4* restrict blockBoundingBox, __global int* restrict rebuildNeighborList,
-        __global real2* restrict blockSizeRange) {
+        __global BOUNDS_POS_CONST real4* restrict posq, __global real4* restrict blockCenter, __global real4* restrict blockBoundingBox, __global int* restrict rebuildNeighborList,
+        __global real2* restrict blockSizeRange
+#ifdef SPATIAL_GATHER_BOUNDS
+        , __global const real4* restrict originalPosq, __global const int* restrict spatialOrder, __global ulong* restrict spatialForces
+#endif
+        ) {
     int index = get_global_id(0);
     int base = index*TILE_SIZE;
     real minSize = 1e38, maxSize = 0;
     while (base < numAtoms) {
+#ifdef SPATIAL_GATHER_BOUNDS
+        // This work item owns the whole tile, including padding. No other work
+        // item reads this tile before the next kernel; bounding math is unchanged.
+        for (int i = base; i < base+TILE_SIZE; i++) {
+            posq[i] = originalPosq[spatialOrder[i]];
+            spatialForces[i] = spatialForces[i+NUM_BLOCKS*TILE_SIZE] = spatialForces[i+2*NUM_BLOCKS*TILE_SIZE] = 0;
+        }
+#endif
         real4 pos = posq[base];
 #ifdef USE_PERIODIC
         APPLY_PERIODIC_TO_POS(pos)
@@ -215,7 +240,7 @@ __kernel void findBlocksWithInteractions(real4 periodicBoxSize, real4 invPeriodi
         const int exclusionStart = exclusionRowIndices[x];
         const int exclusionEnd = exclusionRowIndices[x+1];
         const int numExclusions = exclusionEnd-exclusionStart;
-        for (int j = indexInWarp; j < numExclusions; j += 32)
+        for (int j = indexInWarp; j < min(numExclusions, MAX_EXCLUSIONS); j += 32)
             exclusionsForX[j] = exclusionIndices[exclusionStart+j];
         if (MAX_EXCLUSIONS > 32)
             barrier(CLK_LOCAL_MEM_FENCE);
@@ -288,7 +313,7 @@ __kernel void findBlocksWithInteractions(real4 periodicBoxSize, real4 invPeriodi
                 if (includeBlock2) {
                     int y = sortedBlocks[block2] & BLOCK_INDEX_MASK;
                     for (int k = 0; k < numExclusions; k++)
-                        includeBlock2 &= (exclusionsForX[k] != y);
+                        includeBlock2 &= (EXCLUSION_FOR_X(k) != y);
                 }
             }
             
@@ -625,7 +650,7 @@ __kernel void findBlocksWithInteractions(real4 periodicBoxSize, real4 invPeriodi
         const int exclusionStart = exclusionRowIndices[x];
         const int exclusionEnd = exclusionRowIndices[x+1];
         const int numExclusions = exclusionEnd-exclusionStart;
-        for (int j = get_local_id(0); j < numExclusions; j += get_local_size(0))
+        for (int j = get_local_id(0); j < min(numExclusions, MAX_EXCLUSIONS); j += get_local_size(0))
             exclusionsForX[j] = exclusionIndices[exclusionStart+j];
         barrier(CLK_LOCAL_MEM_FENCE);
         
@@ -645,7 +670,7 @@ __kernel void findBlocksWithInteractions(real4 periodicBoxSize, real4 invPeriodi
             delta.z = max((real) 0, fabs(delta.z)-blockSizeX.z-blockSizeY.z);
             bool hasExclusions = false;
             for (int k = 0; k < numExclusions; k++)
-                hasExclusions |= (exclusionsForX[k] == y);
+                hasExclusions |= (EXCLUSION_FOR_X(k) == y);
             if (j < NUM_BLOCKS && delta.x*delta.x+delta.y*delta.y+delta.z*delta.z < PADDED_CUTOFF_SQUARED && !hasExclusions) {
                 // Add this tile to the buffer.
 

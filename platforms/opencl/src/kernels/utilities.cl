@@ -88,10 +88,23 @@ __kernel void reduceReal4Buffer(__global real4* restrict buffer, __global long* 
 /**
  * Sum the various buffers containing forces.
  */
-__kernel void reduceForces(__global long* restrict longBuffer, __global real4* restrict buffer, int bufferSize, int numBuffers) {
+__kernel void reduceForces(__global long* restrict longBuffer, __global real4* restrict buffer, int bufferSize, int numBuffers
+#ifdef SPATIAL_FORCE_REDUCTION
+        , __global const ulong* restrict spatialForces, __global const int* restrict inverseOrder
+#endif
+        ) {
     int totalSize = bufferSize*numBuffers;
     real scale = 1/(real) 0x100000000;
     for (int index = get_global_id(0); index < bufferSize; index += get_global_size(0)) {
+#ifdef SPATIAL_FORCE_REDUCTION
+        // Preserve the separate merge's fixed-point addition before conversion
+        // to real. Both input buffers are complete when this kernel is launched.
+        int sorted = inverseOrder[index];
+        for (int axis = 0; axis < 3; axis++) {
+            int offset = axis*bufferSize;
+            longBuffer[index+offset] = as_long(as_ulong(longBuffer[index+offset])+spatialForces[sorted+offset]);
+        }
+#endif
         real4 sum = (real4) (scale*longBuffer[index], scale*longBuffer[index+bufferSize], scale*longBuffer[index+2*bufferSize], 0);
         for (int i = index; i < totalSize; i += bufferSize)
             sum += buffer[i];

@@ -1,3 +1,4 @@
+#include "openmm/common/SpatialNonbondedPolicy.h"
 /* -------------------------------------------------------------------------- *
  *                                   OpenMM                                   *
  * -------------------------------------------------------------------------- *
@@ -23,6 +24,7 @@
  * -------------------------------------------------------------------------- */
 
 #include "OpenCLContext.h"
+#include "OpenCLNonbondedUtilities.h"
 #include "OpenCLPlatform.h"
 #include "OpenCLKernelFactory.h"
 #include "OpenCLKernels.h"
@@ -53,7 +55,15 @@ extern "C" OPENMM_EXPORT_COMMON void registerPlatforms() {
 }
 #endif
 
+namespace {
+const map<string, string> spatialDefaults = {{"AtomReordering", "baseline"}};
+}
+
 OpenCLPlatform::OpenCLPlatform() {
+    for (const auto& option : spatialDefaults) {
+        platformProperties.push_back(option.first);
+        setPropertyDefaultValue(option.first, option.second);
+    }
     deprecatedPropertyReplacements["OpenCLDeviceIndex"] = OpenCLDeviceIndex();
     deprecatedPropertyReplacements["OpenCLDeviceName"] = OpenCLDeviceName();
     deprecatedPropertyReplacements["OpenCLPrecision"] = OpenCLPrecision();
@@ -109,6 +119,7 @@ OpenCLPlatform::OpenCLPlatform() {
     platformProperties.push_back(OpenCLPlatformIndex());
     platformProperties.push_back(OpenCLPlatformName());
     platformProperties.push_back(OpenCLPrecision());
+    platformProperties.push_back("AtomReorderingStatus");
     platformProperties.push_back(OpenCLUseCpuPme());
     platformProperties.push_back(OpenCLDisablePmeStream());
     setPropertyDefaultValue(OpenCLDeviceIndex(), "");
@@ -166,7 +177,11 @@ bool OpenCLPlatform::isPlatformSupported() {
 
 const string& OpenCLPlatform::getPropertyValue(const Context& context, const string& property) const {
     const ContextImpl& impl = getContextImpl(context);
-    const PlatformData* data = reinterpret_cast<const PlatformData*>(impl.getPlatformData());
+    PlatformData* data = const_cast<PlatformData*>(reinterpret_cast<const PlatformData*>(impl.getPlatformData()));
+    if (property == "AtomReorderingStatistics") {
+        data->propertyValues[property] = data->contexts[0]->getNonbondedUtilities().getReorderingStatistics();
+        return data->propertyValues.at(property);
+    }
     string propertyName = property;
     if (deprecatedPropertyReplacements.find(property) != deprecatedPropertyReplacements.end())
         propertyName = deprecatedPropertyReplacements.find(property)->second;
@@ -240,6 +255,13 @@ vector<map<string, string> > OpenCLPlatform::getDevices(const map<string, string
 }
 
 void OpenCLPlatform::contextCreated(ContextImpl& context, const map<string, string>& properties) const {
+    map<string, string> spatialProperties;
+    for (const auto& option : spatialDefaults)
+        spatialProperties[option.first] = properties.count(option.first) ? properties.at(option.first) : getPropertyDefaultValue(option.first);
+    const string& mode = spatialProperties.at("AtomReordering");
+    if (mode != "baseline" && mode != "inverse" && mode != "auto")
+        throw OpenMMException("AtomReordering must be baseline, inverse, or auto");
+    const string arithmeticGuard = mode == "baseline" ? "false" : "true";
     const string& platformPropValue = (properties.find(OpenCLPlatformIndex()) == properties.end() ?
             getPropertyDefaultValue(OpenCLPlatformIndex()) : properties.find(OpenCLPlatformIndex())->second);
     const string& devicePropValue = (properties.find(OpenCLDeviceIndex()) == properties.end() ?
@@ -263,6 +285,15 @@ void OpenCLPlatform::contextCreated(ContextImpl& context, const map<string, stri
         stringstream(threadsEnv) >> threads;
     context.setPlatformData(new PlatformData(context.getSystem(), &context, platformPropValue, devicePropValue, precisionPropValue, cpuPmePropValue,
             pmeStreamPropValue, threads, NULL));
+    reinterpret_cast<PlatformData*>(context.getPlatformData())->propertyValues["NonbondedArithmeticGuard"] = arithmeticGuard;
+    PlatformData* data = reinterpret_cast<PlatformData*>(context.getPlatformData());
+    for (const auto& option : spatialDefaults)
+        data->propertyValues[option.first] = properties.count(option.first) ? properties.at(option.first) : getPropertyDefaultValue(option.first);
+    bool supportedLayout = true;
+    for (auto cc : data->contexts)
+        supportedLayout = supportedLayout && cc->getSIMDWidth() == 32 && cc->getDevice().getInfo<CL_DEVICE_TYPE>() != CL_DEVICE_TYPE_CPU;
+    SpatialNonbondedPolicy::configure(data->propertyValues, context.getSystem(), data->contexts.size(), supportedLayout);
+    for (auto cc : data->contexts) cc->getNonbondedUtilities().configureSpatial();
 }
 
 void OpenCLPlatform::linkedContextCreated(ContextImpl& context, ContextImpl& originalContext) const {
@@ -275,6 +306,16 @@ void OpenCLPlatform::linkedContextCreated(ContextImpl& context, ContextImpl& ori
     int threads = reinterpret_cast<PlatformData*>(originalContext.getPlatformData())->threads.getNumThreads();
     context.setPlatformData(new PlatformData(context.getSystem(), &context, platformPropValue, devicePropValue, precisionPropValue, cpuPmePropValue,
             pmeStreamPropValue, threads, &originalContext));
+    reinterpret_cast<PlatformData*>(context.getPlatformData())->propertyValues["NonbondedArithmeticGuard"] =
+            platform.getPropertyValue(originalContext.getOwner(), "NonbondedArithmeticGuard");
+    PlatformData* data = reinterpret_cast<PlatformData*>(context.getPlatformData());
+    for (const auto& option : spatialDefaults)
+        data->propertyValues[option.first] = platform.getPropertyValue(originalContext.getOwner(), option.first);
+    bool supportedLayout = true;
+    for (auto cc : data->contexts)
+        supportedLayout = supportedLayout && cc->getSIMDWidth() == 32 && cc->getDevice().getInfo<CL_DEVICE_TYPE>() != CL_DEVICE_TYPE_CPU;
+    SpatialNonbondedPolicy::configure(data->propertyValues, context.getSystem(), data->contexts.size(), supportedLayout);
+    for (auto cc : data->contexts) cc->getNonbondedUtilities().configureSpatial();
 }
 
 void OpenCLPlatform::contextDestroyed(ContextImpl& context) const {
@@ -336,6 +377,8 @@ OpenCLPlatform::PlatformData::PlatformData(const System& system, ContextImpl* co
     cl::Platform::get(&platforms);
     propertyValues[OpenCLPlatform::OpenCLPlatformName()] = platforms[platformIndex].getInfo<CL_PLATFORM_NAME>();
     propertyValues[OpenCLPlatform::OpenCLPrecision()] = precisionProperty;
+    propertyValues["AtomReorderingExclusionLocality"] = "true";
+    propertyValues["NonbondedArithmeticGuard"] = "false";
     propertyValues[OpenCLPlatform::OpenCLUseCpuPme()] = useCpuPme ? "true" : "false";
     propertyValues[OpenCLPlatform::OpenCLDisablePmeStream()] = disablePmeStream ? "true" : "false";
     contextEnergy.resize(contexts.size());

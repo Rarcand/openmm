@@ -39,12 +39,46 @@ private:
  * Find a bounding box for the atoms in each block.
  */
 extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
-        const real4* __restrict__ posq, real4* __restrict__ blockCenter, real4* __restrict__ blockBoundingBox, int* __restrict__ rebuildNeighborList,
-        real2* __restrict__ blockSizeRange) {
+#ifndef GATHER_SPATIAL_BOUNDS
+        const
+#endif
+        real4* __restrict__ posq, real4* __restrict__ blockCenter, real4* __restrict__ blockBoundingBox, int* __restrict__ rebuildNeighborList,
+        real2* __restrict__ blockSizeRange
+#ifdef GATHER_SPATIAL_BOUNDS
+        , const real4* __restrict__ originalPositions, const int* __restrict__ spatialOrder
+#ifdef CLEAR_SPATIAL_FORCES
+        , unsigned long long* __restrict__ spatialForces
+#endif
+#endif
+        ) {
+#ifdef GATHER_SPATIAL_BOUNDS
+    // More blocks share the gather while one lane still computes each tile's
+    // bounds in the original order, including its periodic-image decisions.
+    const int tilesPerBlock = blockDim.x/BOUNDS_TILE_LANES;
+    int index = blockIdx.x*tilesPerBlock+threadIdx.x/BOUNDS_TILE_LANES;
+#else
     int index = blockIdx.x*blockDim.x+threadIdx.x;
+#endif
     int base = index*TILE_SIZE;
     real minSize = 1e38, maxSize = 0;
+#ifdef GATHER_SPATIAL_BOUNDS
+    // All threads cooperatively gather this chunk before any thread computes
+    // bounds. Keep the existing per-tile arithmetic and its operation order.
+    // Even threads past the last real atom must participate in the barrier.
+    int chunkBase = blockIdx.x*tilesPerBlock*TILE_SIZE;
+    while (chunkBase < numAtoms) {
+        int chunkEnd = min(chunkBase+tilesPerBlock*TILE_SIZE, NUM_BLOCKS*TILE_SIZE);
+        for (int atom = chunkBase+threadIdx.x; atom < chunkEnd; atom += blockDim.x) {
+            posq[atom] = originalPositions[spatialOrder[atom]];
+#ifdef CLEAR_SPATIAL_FORCES
+            spatialForces[atom] = spatialForces[atom+NUM_BLOCKS*TILE_SIZE] = spatialForces[atom+2*NUM_BLOCKS*TILE_SIZE] = 0;
+#endif
+        }
+        __syncthreads();
+        if (threadIdx.x%BOUNDS_TILE_LANES == 0 && base < numAtoms) {
+#else
     while (base < numAtoms) {
+#endif
         real4 pos = posq[base];
 #ifdef USE_PERIODIC
         APPLY_PERIODIC_TO_POS(pos)
@@ -78,7 +112,13 @@ extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, 
         real totalSize = blockSize.x+blockSize.y+blockSize.z;
         minSize = min(minSize, totalSize);
         maxSize = max(maxSize, totalSize);
+#ifdef GATHER_SPATIAL_BOUNDS
+        }
+        chunkBase += tilesPerBlock*gridDim.x*TILE_SIZE;
+        index += tilesPerBlock*gridDim.x;
+#else
         index += blockDim.x*gridDim.x;
+#endif
         base = index*TILE_SIZE;
     }
     
@@ -142,7 +182,8 @@ extern "C" __global__ void sortBoxData(const unsigned int* __restrict__ sortedBl
         real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
 #endif
         const real4* __restrict__ posq, const real4* __restrict__ oldPositions,
-        unsigned int* __restrict__ interactionCount, int* __restrict__ rebuildNeighborList, bool forceRebuild) {
+        unsigned int* __restrict__ interactionCount, int* __restrict__ rebuildNeighborList, bool forceRebuild
+        ) {
     for (int i = threadIdx.x+blockIdx.x*blockDim.x; i < NUM_BLOCKS; i += blockDim.x*gridDim.x) {
         unsigned int index = sortedBlocks[i] & BLOCK_INDEX_MASK;
         sortedBlockCenter[i] = blockCenter[index];
@@ -185,6 +226,11 @@ extern "C" __global__ void sortBoxData(const unsigned int* __restrict__ sortedBl
     }
 }
 
+// Spatial atom counts are restricted below INT_MAX in the host initializer.
+// The high bit carries physical-exclusion metadata only inside the packing
+// buffer. Strip it at every atom-ID output; sparse selection still uses flags.
+#define BUFFER_ATOM_INDEX_MASK 0xffffffffu
+
 __device__ int saveSinglePairs(int x, int* atoms, int* flags, int length, unsigned int maxSinglePairs, unsigned int* singlePairCount, int2* singlePairs, int* sumBuffer, volatile unsigned int& pairStartIndex) {
     // Record interactions that should be computed as single pairs rather than in blocks.
     
@@ -210,7 +256,7 @@ __device__ int saveSinglePairs(int x, int* atoms, int* flags, int length, unsign
         if (count <= MAX_BITS_FOR_PAIRS && pairIndex+count <= maxSinglePairs) {
             int f = flags[i];
             while (f != 0) {
-                singlePairs[pairIndex] = make_int2(atoms[i], x*TILE_SIZE+__ffs(f)-1);
+                singlePairs[pairIndex] = make_int2(atoms[i] & BUFFER_ATOM_INDEX_MASK, x*TILE_SIZE+__ffs(f)-1);
                 f &= f-1;
                 pairIndex++;
             }
@@ -227,12 +273,16 @@ __device__ int saveSinglePairs(int x, int* atoms, int* flags, int length, unsign
         int flag = flags[i];
         bool include = (i < length && __popc(flags[i]) > MAX_BITS_FOR_PAIRS);
         int includeFlags = BALLOT(include);
+        // Ballot exchanges predicates, but is not a shared-memory fence.
+        // Every lane must finish reading before compaction overwrites entries.
+        __syncwarp();
         if (include) {
             int index = numCompacted+__popc(includeFlags&warpMask);
             atoms[index] = atom;
             flags[index] = flag;
         }
         numCompacted += __popc(includeFlags);
+        __syncwarp();
     }
     return numCompacted;
 }
@@ -294,7 +344,8 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE,3) void findBlocksWithInterac
         real4* __restrict__ largeBlockCenter, half3* __restrict__ largeBlockBoundingBox,
 #endif
         const unsigned int* __restrict__ exclusionIndices, const unsigned int* __restrict__ exclusionRowIndices,
-        real4* __restrict__ oldPositions, const int* __restrict__ rebuildNeighborList) {
+        real4* __restrict__ oldPositions, const int* __restrict__ rebuildNeighborList
+        ) {
 
     if (rebuildNeighborList[0] == 0)
         return; // The neighbor list doesn't need to be rebuilt.
@@ -346,12 +397,29 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE,3) void findBlocksWithInterac
         const int exclusionStart = exclusionRowIndices[x];
         const int exclusionEnd = exclusionRowIndices[x+1];
         const int numExclusions = exclusionEnd-exclusionStart;
+        const int* exclusionData = exclusionsForX;
+#ifdef SPATIAL_ATOM_ORDER
+        // Spatial sorting can produce arbitrary adjacency degrees. Cache short
+        // rows in shared memory; read longer rows from global memory instead of
+        // reserving their worst-case size or recompiling after every reorder.
+        if (numExclusions <= MAX_EXCLUSIONS) {
+            for (int j = indexInWarp; j < numExclusions; j += 32)
+                exclusionsForX[j] = exclusionIndices[exclusionStart+j];
+        }
+        else
+            exclusionData = (const int*) exclusionIndices+exclusionStart;
+        SYNC_WARPS;
+#else
         #pragma unroll 4 // (MAX_EXCLUSIONS)
         for (int j = indexInWarp; j < numExclusions; j += 32)
             exclusionsForX[j] = exclusionIndices[exclusionStart+j];
         if (MAX_EXCLUSIONS > 32)
             __syncthreads();
+        else
+            __syncwarp(); // Publish both positions and the short exclusion row.
+#endif
         
+
         // Loop over atom blocks to search for neighbors.  The threads in a warp compare block1 against 32
         // other blocks in parallel.
 
@@ -423,7 +491,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE,3) void findBlocksWithInterac
                     int y = sortedBlocks[block2] & BLOCK_INDEX_MASK;
                     #pragma unroll 4 // (MAX_EXCLUSIONS)
                     for (int k = 0; k < numExclusions; k++)
-                        includeBlock2 &= (exclusionsForX[k] != y);
+                        includeBlock2 &= (exclusionData[k] != y);
                 }
             }
             
@@ -479,6 +547,13 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE,3) void findBlocksWithInterac
 #endif
                 }
                 
+#if MAX_BITS_FOR_PAIRS > 0 && NUM_ATOMS % TILE_SIZE != 0
+                // Sparse pairs must contain real atoms on both sides.  Zero
+                // parameters on padded lanes do not make arbitrary custom
+                // interactions vanish, unlike ordinary Coulomb/Lennard-Jones.
+                if (x == NUM_BLOCKS-1)
+                    interacts &= (1u << (NUM_ATOMS % TILE_SIZE))-1u;
+#endif
                 // Add any interacting atoms to the buffer.
                 
                 int includeAtomFlags = BALLOT(interacts);
@@ -490,6 +565,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE,3) void findBlocksWithInterac
                 neighborsInBuffer += __popc(includeAtomFlags);
                 if (neighborsInBuffer > BUFFER_SIZE-TILE_SIZE) {
                     // Store the new tiles to memory.
+                    __syncwarp();
                     
 #if MAX_BITS_FOR_PAIRS > 0
                     neighborsInBuffer = saveSinglePairs(x, buffer, flagsBuffer, neighborsInBuffer, maxSinglePairs, &interactionCount[1], singlePairs, sumBuffer+warpStart, pairStartIndex);
@@ -498,23 +574,30 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE,3) void findBlocksWithInterac
                     if (tilesToStore > 0) {
                         if (indexInWarp == 0)
                             tileStartIndex = atomicAdd(&interactionCount[0], tilesToStore);
+                        __syncwarp();
                         unsigned int newTileStartIndex = tileStartIndex;
                         if (newTileStartIndex+tilesToStore <= maxTiles) {
                             if (indexInWarp < tilesToStore)
                                 interactingTiles[newTileStartIndex+indexInWarp] = x;
                             #pragma unroll 8 // (GROUP_SIZE / TILE_SIZE)
-                            for (int j = 0; j < tilesToStore; j++)
-                                interactingAtoms[(newTileStartIndex+j)*TILE_SIZE+indexInWarp] = buffer[indexInWarp+j*TILE_SIZE];
+                            for (int j = 0; j < tilesToStore; j++) {
+                                unsigned int atom = buffer[indexInWarp+j*TILE_SIZE];
+                                interactingAtoms[(newTileStartIndex+j)*TILE_SIZE+indexInWarp] = atom & BUFFER_ATOM_INDEX_MASK;
+                            }
                         }
-                        if (indexInWarp+TILE_SIZE*tilesToStore < BUFFER_SIZE)
+                        __syncwarp();
+                        if (indexInWarp+TILE_SIZE*tilesToStore < BUFFER_SIZE) {
                             buffer[indexInWarp] = buffer[indexInWarp+TILE_SIZE*tilesToStore];
+                        }
                         neighborsInBuffer -= TILE_SIZE*tilesToStore;
+                        __syncwarp();
                     }
                 }
             }
         }
         
         // If we have a partially filled buffer,  store it to memory.
+        __syncwarp();
         
 #if MAX_BITS_FOR_PAIRS > 0
         if (neighborsInBuffer > 32)
@@ -524,17 +607,22 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE,3) void findBlocksWithInterac
             unsigned int tilesToStore = (neighborsInBuffer+TILE_SIZE-1)/TILE_SIZE;
             if (indexInWarp == 0)
                 tileStartIndex = atomicAdd(&interactionCount[0], tilesToStore);
+            __syncwarp();
             unsigned int newTileStartIndex = tileStartIndex;
             if (newTileStartIndex+tilesToStore <= maxTiles) {
                 if (indexInWarp < tilesToStore)
                     interactingTiles[newTileStartIndex+indexInWarp] = x;
                 #pragma unroll 8 // (GROUP_SIZE / TILE_SIZE)
-                for (int j = 0; j < tilesToStore; j++)
-                    interactingAtoms[(newTileStartIndex+j)*TILE_SIZE+indexInWarp] = (indexInWarp+j*TILE_SIZE < neighborsInBuffer ? buffer[indexInWarp+j*TILE_SIZE] : NUM_ATOMS);
+                for (int j = 0; j < tilesToStore; j++) {
+                    unsigned int atom = (indexInWarp+j*TILE_SIZE < neighborsInBuffer ? buffer[indexInWarp+j*TILE_SIZE] : NUM_ATOMS);
+                    interactingAtoms[(newTileStartIndex+j)*TILE_SIZE+indexInWarp] = atom & BUFFER_ATOM_INDEX_MASK;
+                }
             }
         }
+        // Finish shared reads before another X block reuses this warp's storage.
+        __syncwarp();
     }
-    
+
     // Record the positions the neighbor list is based on.
     
     for (int i = threadIdx.x+blockIdx.x*blockDim.x; i < NUM_ATOMS; i += blockDim.x*gridDim.x)
