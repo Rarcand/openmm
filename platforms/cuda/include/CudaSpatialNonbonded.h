@@ -12,7 +12,8 @@ namespace OpenMM {
 class CudaNonbondedUtilities;
 class System;
 
-/** Experimental spatial view for the CUDA default nonbonded kernel.
+/**
+ * Experimental spatial view for the CUDA default nonbonded kernel.
  * Original positions, velocities, PME, exceptions, and bonded arrays retain atom IDs.
  * Uses unrestricted GPU Hilbert sorting and inverse force merging.
  */

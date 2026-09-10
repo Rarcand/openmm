@@ -1738,6 +1738,15 @@ void CommonCalcCustomCentroidBondForceKernel::initialize(const System& system, c
         force.getBondParameters(i, groups, paramVector[i]);
         for (int j = 0; j < groups.size(); j++)
             bondGroupVec[i+j*numBonds] = groups[j];
+        if (cc.getNonbondedUtilities().getUsesStableAtomOrder()) {
+            // Translate all particles connected by a centroid bond together.
+
+            vector<int> particles;
+            for (int group : groups)
+                particles.insert(particles.end(), groupParticleVec.begin()+groupOffsetVec[group],
+                        groupParticleVec.begin()+groupOffsetVec[group+1]);
+            cc.registerRecenterGroup(particles);
+        }
     }
     params->setParameterValues(paramVector, true);
     bondGroups.initialize<int>(cc, bondGroupVec.size(), "bondGroups");

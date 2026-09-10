@@ -22,9 +22,11 @@
 #include "openmm/CustomCentroidBondForce.h"
 
 namespace OpenMM {
-/** Shared eligibility policy. Unknown independent neighbor consumers use legacy
+/**
+ * Shared eligibility policy. Unknown independent neighbor consumers use legacy
  * execution in auto mode until explicitly migrated. This is not a claim of
- * spatial support for every Force implementation. */
+ * spatial support for every Force implementation.
+ */
 class SpatialNonbondedPolicy {
 public:
     static std::string unsupportedReason(const System& system) {

@@ -65,8 +65,8 @@ void CudaSpatialNonbonded::initialize(const System& system) {
     if (pairs.empty() || pairs.size() > numeric_limits<int>::max()/32)
         throw OpenMMException("Invalid spatial exclusion capacity");
     numRecords = pairs.size();
-    // Cache short adjacency rows; the neighbor-list kernel reads longer rows
-    // from global memory. No spatial permutation requires recompilation.
+    // Use a fixed cache capacity; read longer exclusion rows from global memory.
+
     nb.maxExclusions = min(blocks, 32);
     positions.initialize(cc, padded, cc.getPosq().getElementSize(), "spatialPositions");
     forces.initialize<long long>(cc, 3*padded, "spatialForces");
@@ -91,8 +91,8 @@ void CudaSpatialNonbonded::initialize(const System& system) {
     nb.exclusionIndices.resize(2*(size_t) numRecords);
     exclusionSorter = cc.createSort(new ExclusionSortTrait(), numRecords, false);
 
-    // Small standard-force systems can omit the neighbor list altogether.
-    // Their positions still need gathering, so retain the standalone pass.
+    // Gather positions separately when there is no neighbor list.
+
     boundsGather = boundsGather && nb.useNeighborList && nb.numTiles > 0;
     map<string, string> defines;
     defines["NUM_ATOMS"] = cc.intToString(n);
@@ -114,10 +114,9 @@ void CudaSpatialNonbonded::initialize(const System& system) {
         cc.addReorderedArray(param.getArray(), *parameters.back());
     }
     parameterArrays->seal();
-    // Parameters may be produced by a force kernel after prepareInteractions().
-    // Refresh them (and posq.w charges) immediately before the default pair kernel.
-    // Producers invalidate this cache for updateParametersInContext and offsets.
-    string source = CudaKernelSources::vectorOps+CudaKernelSources::spatialNonbonded;
+    // Refresh parameters and charges after producers, before the pair kernel.
+
+    string source = CudaKernelSources::vectorOps+CommonKernelSources::spatialSortKeys+CudaKernelSources::spatialNonbonded;
     source += "\nextern \"C\" __global__ void spatialParameters(const real4* original, real4* sorted, const int* order"+parameterArrays->getArguments("")+") {\n"
               "for (int s=blockIdx.x*blockDim.x+threadIdx.x; s<NUM_ATOMS; s+=blockDim.x*gridDim.x) {\n"
               "sorted[s].w=original[order[s]].w;\n"+parameterArrays->getGatherSource("s", "order[s]")+"}}\n";
@@ -229,8 +228,8 @@ void CudaSpatialNonbonded::gatherParameters(bool includeForces) {
 void CudaSpatialNonbonded::mergeForces() {
     if (!forcesPending)
         return;
-    // Called after ForcePostComputations, including the PME queue wait. No original
-    // force writer can overlap this non-atomic one-to-one merge.
+    // PME and other original-force writers must finish before this non-atomic merge.
+
     nb.beginPhase("force_merge");
     execute("spatialMerge", {&cc.getForce().getDevicePointer(), &forces.getDevicePointer(),
             &(inverseMerge ? inverseOrder.getDevicePointer() : order.getDevicePointer())}, cc.getNumAtoms());

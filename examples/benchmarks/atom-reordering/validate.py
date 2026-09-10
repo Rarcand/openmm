@@ -7,140 +7,197 @@ import numpy as np
 from benchmark import load_openmm, properties, snapshot, check_snapshot, digest
 
 def make_system(mm, case):
+    # Use a larger grid to exercise neighbor-list construction.
     n = 3101 if case == 'neighbors' else 131
     system = mm.System()
-    for _ in range(n): system.addParticle(39.9)
+    for _ in range(n):
+        system.addParticle(39.9)
     nb = mm.NonbondedForce()
-    methods = dict(nocutoff=nb.NoCutoff, nonperiodic=nb.CutoffNonPeriodic,
-                   gbsa=nb.NoCutoff, pme=nb.PME, ewald=nb.Ewald, ljpme=nb.LJPME)
+    methods = dict(nocutoff=nb.NoCutoff,
+        nonperiodic=nb.CutoffNonPeriodic,
+        gbsa=nb.NoCutoff,
+        pme=nb.PME,
+        ewald=nb.Ewald,
+        ljpme=nb.LJPME)
     nb.setNonbondedMethod(methods.get(case, nb.CutoffPeriodic))
-    nb.setCutoffDistance(.9)
+    nb.setCutoffDistance(0.9)
     nb.addGlobalParameter('charge_scale', 0)
-    for i in range(n): nb.addParticle(.003 if i%2 else -.003, .025, .001)
-    nb.addParticleParameterOffset('charge_scale', 0, .001, 0, 0)
-    for i in range(0,n-1,3): nb.addException(i,i+1,0,.025,0)
+    for i in range(n):
+        nb.addParticle(0.003 if i % 2 else -0.003, 0.025, 0.001)
+    nb.addParticleParameterOffset('charge_scale', 0, 0.001, 0, 0)
+    for i in range(0, n - 1, 3):
+        nb.addException(i, i + 1, 0, 0.025, 0)
     if case == 'gbsa':
         gb = mm.GBSAOBCForce()
-        for i in range(n): gb.addParticle(.003 if i%2 else -.003,.15,.8)
+        for i in range(n):
+            gb.addParticle(0.003 if i % 2 else -0.003, 0.15, 0.8)
         system.addForce(gb)
     system.addForce(nb)
     external = mm.CustomExternalForce('0.0001*x*x')
     external.setForceGroup(1)
     external.addParticle(0, [])
     system.addForce(external)
-    if case in ('custom','groups'):
-        custom = mm.CustomNonbondedForce('scale*'+('a1*a2' if case=='groups' else 'v1*v2')+'/(1+r^6)')
-        custom.addGlobalParameter('scale',.01)
+    if case in ('custom', 'groups'):
+        custom = mm.CustomNonbondedForce('scale*' + ('a1*a2' if case == 'groups' else 'v1*v2') + '/(1+r^6)')
+        custom.addGlobalParameter('scale', 0.01)
         custom.addPerParticleParameter('a')
-        if case=='custom': custom.addComputedValue('v','a*scale')
-        for _ in range(n): custom.addParticle([.01])
-        for i in range(0,n-1,3): custom.addExclusion(i,i+1)
+        if case == 'custom':
+            custom.addComputedValue('v', 'a*scale')
+        for _ in range(n):
+            custom.addParticle([0.01])
+        for i in range(0, n - 1, 3):
+            custom.addExclusion(i, i + 1)
         custom.setNonbondedMethod(custom.CutoffPeriodic)
-        custom.setCutoffDistance(.9)
-        if case == 'groups': custom.addInteractionGroup(set(range(10)),set(range(10,20)))
+        custom.setCutoffDistance(0.9)
+        if case == 'groups':
+            custom.addInteractionGroup(set(range(10)), set(range(10, 20)))
         system.addForce(custom)
     if case == 'bonded':
-        compound = mm.CustomCompoundBondForce(2,'0.01*distance(p1,p2)^2')
-        compound.addBond([0,1],[])
+        compound = mm.CustomCompoundBondForce(2, '0.01*distance(p1,p2)^2')
+        compound.addBond([0, 1], [])
         system.addForce(compound)
-        centroid = mm.CustomCentroidBondForce(2,'0.01*distance(g1,g2)^2')
-        centroid.addGroup([0,1]); centroid.addGroup([2,3]); centroid.addBond([0,1],[])
+        centroid = mm.CustomCentroidBondForce(2, '0.01*distance(g1,g2)^2')
+        centroid.addGroup([0, 1])
+        centroid.addGroup([2, 3])
+        centroid.addBond([0, 1], [])
         system.addForce(centroid)
     if case == 'virtual':
-        system.setParticleMass(n-1,0)
-        system.setVirtualSite(n-1,mm.TwoParticleAverageSite(0,1,.5,.5))
-        system.addConstraint(0,1,.3)
-    system.setDefaultPeriodicBoxVectors(mm.Vec3(4,0,0),mm.Vec3(.2,4,0),mm.Vec3(-.1,.1,4))
-    if case=='ewald': system.setDefaultPeriodicBoxVectors(mm.Vec3(4,0,0),mm.Vec3(0,4,0),mm.Vec3(0,0,4))
-    width,spacing = (15,.08) if n>3000 else (7,.3)
-    pos = [mm.Vec3(.2+(i%width)*spacing,.2+((i//width)%width)*spacing,.2+(i//(width*width))*spacing) for i in range(n)]
-    return system,nb,pos
+        system.setParticleMass(n - 1, 0)
+        system.setVirtualSite(n - 1, mm.TwoParticleAverageSite(0, 1, 0.5, 0.5))
+        system.addConstraint(0, 1, 0.3)
+    system.setDefaultPeriodicBoxVectors(mm.Vec3(4, 0, 0), mm.Vec3(0.2, 4, 0), mm.Vec3(-0.1, 0.1, 4))
+    if case == 'ewald':
+        system.setDefaultPeriodicBoxVectors(mm.Vec3(4, 0, 0), mm.Vec3(0, 4, 0), mm.Vec3(0, 0, 4))
+    # These synthetic particles are placed on a regular grid.
+    width, spacing = (15, 0.08) if n > 3000 else (7, 0.3)
+    pos = [mm.Vec3(0.2 + i % width * spacing,
+        0.2 + i // width % width * spacing,
+        0.2 + i // (width * width) * spacing) for i in range(n)]
+    return (system, nb, pos)
 
 def integrator(mm, kind):
     if kind == 'langevin':
-        i=mm.LangevinMiddleIntegrator(100,1,.0001);i.setRandomNumberSeed(17);return i
+        i = mm.LangevinMiddleIntegrator(100, 1, 0.0001)
+        i.setRandomNumberSeed(17)
+        return i
     if kind == 'brownian':
-        i=mm.BrownianIntegrator(100,1,.0001);i.setRandomNumberSeed(17);return i
+        i = mm.BrownianIntegrator(100, 1, 0.0001)
+        i.setRandomNumberSeed(17)
+        return i
     if kind == 'custom':
-        i=mm.CustomIntegrator(.0001);i.addComputePerDof('v','v+dt*f/m');i.addComputePerDof('x','x+dt*v');return i
-    return mm.VerletIntegrator(.0001)
+        i = mm.CustomIntegrator(0.0001)
+        i.addComputePerDof('v', 'v+dt*f/m')
+        i.addComputePerDof('x', 'x+dt*v')
+        return i
+    return mm.VerletIntegrator(0.0001)
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--backend',choices=['CUDA','OpenCL'],required=True)
-    p.add_argument('--library-dir',type=Path)
-    p.add_argument('--device-index',default='0')
-    p.add_argument('--opencl-platform-index',default='0')
-    p.add_argument('--mode',choices=['pristine','auto'],default='auto')
-    p.add_argument('--precision',choices=['mixed','double'],default='mixed')
-    p.add_argument('--output',type=Path,required=True)
-    p.add_argument('--reference',type=Path,help='Pristine .npz generated by this script')
-    p.add_argument('--test-library',type=Path,help='Optional independent C++ work-view test library')
-    a=p.parse_args()
-    if a.output.exists() or Path(str(a.output)+'.npz').exists():p.error('Output exists')
-    if a.test_library and a.device_index!='0': p.error('The independent C++ test currently selects device 0')
-    mm,libs=load_openmm(a.backend,a.library_dir)
-    platform=mm.Platform.getPlatformByName(a.backend)
-    output,results={},[]
-    reference=np.load(a.reference) if a.reference else None
-    for case in ('periodic','neighbors','pme','ewald','ljpme','custom','bonded','virtual','nocutoff','nonperiodic','gbsa','groups'):
-        system,nb,pos=make_system(mm,case)
-        kind={'custom':'custom','bonded':'langevin','periodic':'brownian'}.get(case,'verlet')
-        integ=integrator(mm,kind)
-        props=properties(a.backend,a.precision,a.mode)
-        props['DeviceIndex']=a.device_index
-        if a.backend=='OpenCL': props['OpenCLPlatformIndex']=a.opencl_platform_index
-        context=mm.Context(system,integ,platform,props)
-        context.setPositions(pos);context.setVelocitiesToTemperature(0);context.computeVirtualSites()
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--backend', choices=['CUDA', 'OpenCL'], required=True)
+    p.add_argument('--library-dir', type=Path)
+    p.add_argument('--device-index', default='0')
+    p.add_argument('--opencl-platform-index', default='0')
+    p.add_argument('--mode', choices=['pristine', 'auto'], default='auto')
+    p.add_argument('--precision', choices=['mixed', 'double'], default='mixed')
+    p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--reference', type=Path, help='Pristine .npz generated by this script')
+    p.add_argument('--test-library', type=Path, help='Optional independent C++ work-view test library')
+    a = p.parse_args()
+    if a.output.exists() or Path(str(a.output) + '.npz').exists():
+        p.error('Output exists')
+    if a.test_library and a.device_index != '0':
+        p.error('The independent C++ test currently selects device 0')
+    mm, libs = load_openmm(a.backend, a.library_dir)
+    platform = mm.Platform.getPlatformByName(a.backend)
+    output, results = ({}, [])
+    reference = np.load(a.reference) if a.reference else None
+    for case in ('periodic',
+        'neighbors',
+        'pme',
+        'ewald',
+        'ljpme',
+        'custom',
+        'bonded',
+        'virtual',
+        'nocutoff',
+        'nonperiodic',
+        'gbsa',
+        'groups'):
+        system, nb, pos = make_system(mm, case)
+        kind = {'custom': 'custom', 'bonded': 'langevin', 'periodic': 'brownian'}.get(case, 'verlet')
+        integ = integrator(mm, kind)
+        props = properties(a.backend, a.precision, a.mode)
+        props['DeviceIndex'] = a.device_index
+        if a.backend == 'OpenCL':
+            props['OpenCLPlatformIndex'] = a.opencl_platform_index
+        context = mm.Context(system, integ, platform, props)
+        context.setPositions(pos)
+        context.setVelocitiesToTemperature(0)
+        context.computeVirtualSites()
         route = 'pristine'
-        if a.mode=='auto':
-            route=platform.getPropertyValue(context,'AtomReorderingStatus')
-            expected = 'baseline:' if case in ('nocutoff','nonperiodic','gbsa','groups') else 'spatial'
-            assert route.startswith(expected),(case,route)
+        if a.mode == 'auto':
+            route = platform.getPropertyValue(context, 'AtomReorderingStatus')
+            expected = 'baseline:' if case in ('nocutoff', 'nonperiodic', 'gbsa', 'groups') else 'spatial'
+            assert route.startswith(expected), (case, route)
+
         def save(stage):
-            actual=snapshot(context);key=case+'-'+stage
+            actual = snapshot(context)
+            key = case + '-' + stage
             if reference is not None:
-                check_snapshot(actual,dict(forces=reference[key+'-forces'],energy=reference[key+'-energy']))
-            for name,value in actual.items(): output[key+'-'+name]=value
+                check_snapshot(actual, dict(forces=reference[key + '-forces'], energy=reference[key + '-energy']))
+            for name, value in actual.items():
+                output[key + '-' + name] = value
         save('initial')
-        context.setParameter('charge_scale',.2)
-        if case in ('custom','groups'):context.setParameter('scale',.02)
-        q,s,e=nb.getParticleParameters(1);nb.setParticleParameters(1,q*1.1,s,e);nb.updateParametersInContext(context)
-        # An unrelated energy-only group must not consume parameter updates.
-        context.getState(energy=True,groups=2)
-        context.getState(energy=True,groups=1)
+        context.setParameter('charge_scale', 0.2)
+        if case in ('custom', 'groups'):
+            context.setParameter('scale', 0.02)
+        q, s, e = nb.getParticleParameters(1)
+        nb.setParticleParameters(1, q * 1.1, s, e)
+        nb.updateParametersInContext(context)
+        # An unrelated force group must not consume pending parameter updates.
+        context.getState(energy=True, groups=2)
+        context.getState(energy=True, groups=1)
         save('updated')
-        state=context.getState(positions=True,velocities=True,parameters=True)
-        checkpoint=context.createCheckpoint()
+        state = context.getState(positions=True, velocities=True, parameters=True)
+        checkpoint = context.createCheckpoint()
         integ.step(251)
         assert np.isfinite(snapshot(context)['forces']).all()
-        context.loadCheckpoint(checkpoint);save('checkpoint')
-        context.reinitialize(preserveState=True);save('reinitialized')
-        context.setState(state);save('restored')
-        results.append(dict(case=case,integrator=kind,route=route,passed=True))
-        del context,integ
-        print(case,'passed',flush=True)
+        # Compare restored coordinates, not stochastic trajectories.
+        context.loadCheckpoint(checkpoint)
+        save('checkpoint')
+        context.reinitialize(preserveState=True)
+        save('reinitialized')
+        context.setState(state)
+        save('restored')
+        results.append(dict(case=case, integrator=kind, route=route, passed=True))
+        del context, integ
+        print(case, 'passed', flush=True)
     if reference is not None:
-        assert set(reference.files)==set(output);reference.close()
-    independent=None
+        assert set(reference.files) == set(output)
+        reference.close()
+    independent = None
     if a.test_library:
-        assert a.mode=='auto'
-        system=mm.System()
-        for _ in range(131):system.addParticle(1)
-        integrators=[mm.VerletIntegrator(.001),mm.VerletIntegrator(.001)]
-        base_props=properties(a.backend,a.precision,'baseline')
-        base_props['DeviceIndex']=a.device_index
-        if a.backend=='OpenCL': base_props['OpenCLPlatformIndex']=a.opencl_platform_index
-        contexts=[mm.Context(system,i,platform,base_props) for i in integrators]
-        lib=ctypes.CDLL(str(a.test_library.resolve()));call=lib.testContextArrays
-        call.argtypes=[ctypes.c_void_p,ctypes.c_void_p,ctypes.c_char_p];call.restype=ctypes.c_char_p
-        result=call(int(contexts[0].this),int(contexts[1].this),a.precision.encode()).decode()
-        if result.startswith('ERROR:'):raise RuntimeError(result)
-        independent=dict(result=json.loads(result),library_sha256=digest(a.test_library))
-    a.output.parent.mkdir(parents=True,exist_ok=True)
-    np.savez(str(a.output)+'.npz',**output)
-    a.output.write_text(json.dumps(dict(backend=a.backend,precision=a.precision,libraries=libs,results=results,
-        snapshots=len(output)//2,reference=str(a.reference) if a.reference else None,
-        reference_sha256=digest(a.reference) if a.reference else None,independent=independent,passed=True),indent=2)+'\n')
-
-if __name__=='__main__':main()
+        assert a.mode == 'auto'
+        system = mm.System()
+        for _ in range(131):
+            system.addParticle(1)
+        integrators = [mm.VerletIntegrator(0.001), mm.VerletIntegrator(0.001)]
+        base_props = properties(a.backend, a.precision, 'baseline')
+        base_props['DeviceIndex'] = a.device_index
+        if a.backend == 'OpenCL':
+            base_props['OpenCLPlatformIndex'] = a.opencl_platform_index
+        contexts = [mm.Context(system, i, platform, base_props) for i in integrators]
+        lib = ctypes.CDLL(str(a.test_library.resolve()))
+        call = lib.testContextArrays
+        call.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p]
+        call.restype = ctypes.c_char_p
+        result = call(int(contexts[0].this), int(contexts[1].this), a.precision.encode()).decode()
+        if result.startswith('ERROR:'):
+            raise RuntimeError(result)
+        independent = dict(result=json.loads(result), library_sha256=digest(a.test_library))
+    a.output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(str(a.output) + '.npz', **output)
+    a.output.write_text(json.dumps(dict(backend=a.backend, precision=a.precision, libraries=libs, results=results, snapshots=len(output) // 2, reference=str(a.reference) if a.reference else None, reference_sha256=digest(a.reference) if a.reference else None, independent=independent, passed=True),
+        indent=2) + '\n')
+if __name__ == '__main__':
+    main()

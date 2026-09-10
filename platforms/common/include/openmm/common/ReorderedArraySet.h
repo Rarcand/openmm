@@ -71,12 +71,16 @@ public:
             validateEntry(entry);
     }
 
-    /** Invalidate after a source update, allocation change, or new permutation. */
+    /**
+     * Invalidate after a source update, allocation change, or new permutation.
+     */
     void invalidate() { dirty = true; }
 
     bool isDirty() const { return dirty; }
 
-    /** Called only after successfully submitting the gather on the consumer queue. */
+    /**
+     * Called only after successfully submitting the gather on the consumer queue.
+     */
     void markGathered() {
         requireSealed();
         dirty = false;
@@ -87,7 +91,9 @@ public:
         return entries;
     }
 
-    /** Emit additional arguments, including their leading commas. */
+    /**
+     * Emit additional arguments, including their leading commas.
+     */
     std::string getArguments(const std::string& addressSpace) const {
         requireSealed();
         std::stringstream source;
@@ -99,7 +105,9 @@ public:
         return source.str();
     }
 
-    /** Emit copies for a valid sorted index and its original atom ID. */
+    /**
+     * Emit copies for a valid sorted index and its original atom ID.
+     */
     std::string getGatherSource(const std::string& sortedIndex, const std::string& originalIndex) const {
         requireSealed();
         std::stringstream source;

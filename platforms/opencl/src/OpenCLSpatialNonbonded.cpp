@@ -63,8 +63,8 @@ void OpenCLSpatialNonbonded::initialize(const System& system) {
     if (pairs.empty() || pairs.size() > numeric_limits<int>::max()/32)
         throw OpenMMException("Invalid spatial exclusion capacity");
     numRecords = pairs.size();
-    // Cache short adjacency rows; the neighbor-list kernel reads longer rows
-    // from global memory. No spatial permutation requires recompilation.
+    // Use a fixed cache capacity; read longer exclusion rows from global memory.
+
     nb.maxExclusions = min(blocks, 32);
     positions.initialize(cc, padded, cc.getPosq().getElementSize(), "spatialPositions");
     forces.initialize<long long>(cc, 3*padded, "spatialForces");
@@ -110,7 +110,7 @@ void OpenCLSpatialNonbonded::initialize(const System& system) {
         cc.addReorderedArray(param.getArray(), *parameters.back());
     }
     parameterArrays->seal();
-    string source = CommonKernelSources::spatialNonbonded;
+    string source = CommonKernelSources::spatialSortKeys+CommonKernelSources::spatialNonbonded;
     source += "\nKERNEL void spatialParameters(GLOBAL const real4* original, GLOBAL real4* sorted, GLOBAL const int* order"+parameterArrays->getArguments("GLOBAL")+") {\n"
               "for (int s=GLOBAL_ID; s<NUM_ATOMS; s+=GLOBAL_SIZE) {\n"
               "sorted[s].w=original[order[s]].w;\n"+parameterArrays->getGatherSource("s", "order[s]")+"}}\n";
@@ -197,6 +197,7 @@ void OpenCLSpatialNonbonded::prepare() {
     if (reorderCount == 0 || cc.getStepsSinceReorder() >= reorderInterval) reorder();
     if (usesBoundsGather()) return;
     // These bindings remain constant over the Context lifetime.
+
     if (!boundArgs.count("spatialPositions")) bind("spatialPositions", {&cc.getPosq(), &positions, &order, &forces});
     kernels.at("spatialPositions")->execute(cc.getPaddedNumAtoms(), 256);
 }
@@ -228,6 +229,7 @@ bool OpenCLSpatialNonbonded::mergeForces() {
         }
         // The caller has joined PME post-computations. Reduce before virtual
         // sites and integrators consume original-order forces.
+
         mergeReductionKernel->execute(cc.getPaddedNumAtoms(), 128);
         forcesPending = false;
         return true;

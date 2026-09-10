@@ -1,6 +1,7 @@
 // Native integration test only: not linked into production OpenMM libraries.
 #include "openmm/Context.h"
 #include "openmm/CustomExternalForce.h"
+#include "openmm/CustomCentroidBondForce.h"
 #include "openmm/NonbondedForce.h"
 #include "openmm/System.h"
 #include "openmm/VerletIntegrator.h"
@@ -259,6 +260,59 @@ static void testLongExclusionRows(OpenMM::Platform& platform, const string& prec
         require(longest>32, "Long-row fixture did not exceed exclusion cache capacity");
     }
 }
+// Exercise both a centroid group crossing a box face and a bond crossing it.
+static void testCentroidRecentering(OpenMM::Platform& platform, const string& precision) {
+    using namespace OpenMM;
+    System system;
+    auto* nonbonded = new NonbondedForce();
+    nonbonded->setNonbondedMethod(NonbondedForce::CutoffPeriodic);
+    nonbonded->setCutoffDistance(1.0);
+    for (int i = 0; i < 4; i++) {
+        system.addParticle(40);
+        nonbonded->addParticle(0, .2, 0);
+    }
+    system.addForce(nonbonded);
+    auto* centroid = new CustomCentroidBondForce(2, "distance(g1,g2)^2");
+    centroid->addGroup({0, 1});
+    centroid->addGroup({2, 3});
+    centroid->addBond({0, 1}, {});
+    system.addForce(centroid);
+    system.setDefaultPeriodicBoxVectors(Vec3(4, 0, 0), Vec3(0, 4, 0), Vec3(0, 0, 4));
+    map<string, string> properties = {{"Precision", precision}, {"DeviceIndex", "0"}, {"AtomReordering", "baseline"}};
+#ifndef DIAGNOSTIC_CUDA
+    properties["OpenCLPlatformIndex"] = "0";
+#endif
+    VerletIntegrator originalIntegrator(1e-8), spatialIntegrator(1e-8);
+    Context original(system, originalIntegrator, platform, properties);
+    properties["AtomReordering"] = "inverse";
+    Context spatial(system, spatialIntegrator, platform, properties);
+    for (const auto& x : vector<vector<double>>{{3.9, 4.1, 4.5, 4.7}, {3.7, 3.9, 4.1, 4.3}}) {
+        vector<Vec3> positions;
+        for (double value : x)
+            positions.push_back(Vec3(value, .5, .5));
+        spatial.setPositions(positions);
+        double distance = (x[2]+x[3]-x[0]-x[1])/2;
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass == 1)
+                spatialIntegrator.step(251);
+            State actual = spatial.getState(State::Positions | State::Forces | State::Energy);
+            original.setPositions(actual.getPositions());
+            State expected = original.getState(State::Forces | State::Energy);
+            require(abs(actual.getPotentialEnergy()-expected.getPotentialEnergy()) < 1e-5, "Centroid recentering energy mismatch");
+            if (pass == 0)
+                require(abs(actual.getPotentialEnergy()-distance*distance) < 1e-5, "Incorrect centroid boundary energy");
+            for (int i = 0; i < 4; i++) {
+                for (int axis = 0; axis < 3; axis++) {
+                    require(abs(actual.getForces()[i][axis]-expected.getForces()[i][axis]) < 1e-5, "Centroid recentering force mismatch");
+                    if (pass == 0) {
+                        double force = axis == 0 ? (i < 2 ? distance : -distance) : 0;
+                        require(abs(actual.getForces()[i][axis]-force) < 1e-5, "Incorrect centroid boundary force");
+                    }
+                }
+            }
+        }
+    }
+}
 int main(int argc, char** argv) {
     try {
         string precision=argc>1 ? argv[1] : "mixed";
@@ -278,6 +332,7 @@ int main(int argc, char** argv) {
         OpenMM::ContextArrayTestDriver driver;
         driver.run(first,second,precision);
         testLongExclusionRows(platform,precision);
+        testCentroidRecentering(platform,precision);
         cout << OpenMM::checks << " assertions passed" << endl;
         return 0;
     } catch(const exception& e) {cerr << e.what() << endl;return 1;}

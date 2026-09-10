@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "openmm/common/ArrayInterface.h"
 namespace OpenMM {
-/** A borrowed, full-tile work view for one force evaluation.
+/**
+ * A borrowed, full-tile work view for one force evaluation.
  *
  * Acquire after parameter producers, on the Context's execution queue, through
  * NonbondedUtilities::getSpatialWorkView(). Do not retain it across evaluations,
