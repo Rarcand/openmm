@@ -706,7 +706,7 @@ void CommonConstantPotentialCGSolver::ensureValid(CommonCalcConstantPotentialFor
         kernel.pmeShouldSort = true;
         kernel.pmeExecute(false, false, true);
         kernel.pmeShouldSort = true;
-        vector<long> derivatives(numElectrodeParticles);
+        vector<int64_t> derivatives(numElectrodeParticles);
         kernel.chargeDerivativesFixed.download(derivatives);
         double pmeTerm = derivatives[0] / (double) 0x100000000;
 
