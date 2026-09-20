@@ -27,8 +27,14 @@
 #include "CudaArray.h"
 #include "CudaContext.h"
 #include "CudaKernelSources.h"
+#include "CommonKernelSources.h"
 #include "CudaExpressionUtilities.h"
+#include "CudaSpatialNonbonded.h"
+#include "openmm/common/ContextSelector.h"
 #include <algorithm>
+#include <cmath>
+#include "openmm/NonbondedForce.h"
+#include "openmm/CustomNonbondedForce.h"
 #include <map>
 #include <set>
 #include <utility>
@@ -58,7 +64,7 @@ public:
 };
 
 CudaNonbondedUtilities::CudaNonbondedUtilities(CudaContext& context) : context(context), useCutoff(false), usePeriodic(false), useNeighborList(false), anyExclusions(false), usePadding(true),
-        pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), tilesAfterReorder(0) {
+        pinnedCountBuffer(NULL), forceRebuildNeighborList(true), groupFlags(0), canUsePairList(true), canOmitExcludedPairs(true), tilesAfterReorder(0) {
     // Decide how many thread blocks to use.
 
     string errorMessage = "Error initializing nonbonded utilities";
@@ -68,7 +74,7 @@ CudaNonbondedUtilities::CudaNonbondedUtilities(CudaContext& context) : context(c
     CHECK_RESULT(cuMemHostAlloc((void**) &pinnedCountBuffer, 2*sizeof(unsigned int), CU_MEMHOSTALLOC_PORTABLE));
     numForceThreadBlocks = 4*multiprocessors;
     forceThreadBlockSize = (context.getComputeCapability() < 2.0 ? 128 : 256);
-    
+
     // When building the neighbor list, we can optionally use large blocks (1024 atoms) to
     // accelerate the process.  This makes building the neighbor list faster, but it prevents
     // us from sorting atom blocks by size, which leads to a slightly less efficient neighbor
@@ -76,16 +82,20 @@ CudaNonbondedUtilities::CudaNonbondedUtilities(CudaContext& context) : context(c
 
     useLargeBlocks = (context.getNumAtoms() > 90000);
     setKernelSource(CudaKernelSources::nonbonded);
+    string mode = context.getPlatformData().propertyValues[CudaPlatform::CudaAtomReordering()];
+    if (mode != "baseline")
+        spatial.reset(new CudaSpatialNonbonded(context, *this));
 }
 
 CudaNonbondedUtilities::~CudaNonbondedUtilities() {
+
     if (pinnedCountBuffer != NULL)
         cuMemFreeHost(pinnedCountBuffer);
     cuEventDestroy(downloadCountEvent);
 }
 
 void CudaNonbondedUtilities::addInteraction(bool usesCutoff, bool usesPeriodic, bool usesExclusions, double cutoffDistance,
-        const vector<vector<int> >& exclusionList, const string& kernel, int forceGroup, bool useNeighborList, bool supportsPairList) {
+        const vector<vector<int> >& exclusionList, const string& kernel, int forceGroup, bool useNeighborList, bool supportsPairList, bool supportsExclusionOmission) {
     if (groupCutoff.size() > 0) {
         if (usesCutoff != useCutoff)
             throw OpenMMException("All Forces must agree on whether to use a cutoff");
@@ -102,6 +112,7 @@ void CudaNonbondedUtilities::addInteraction(bool usesCutoff, bool usesPeriodic, 
     groupCutoff[forceGroup] = cutoffDistance;
     groupFlags |= 1<<forceGroup;
     canUsePairList &= supportsPairList;
+    canOmitExcludedPairs &= supportsExclusionOmission;
     if (kernel.size() > 0) {
         if (groupKernelSource.find(forceGroup) == groupKernelSource.end())
             groupKernelSource[forceGroup] = "";
@@ -122,7 +133,7 @@ void CudaNonbondedUtilities::addArgument(ComputeParameterInfo parameter) {
 
 string CudaNonbondedUtilities::addEnergyParameterDerivative(const string& param) {
     // See if the parameter has already been added.
-    
+
     int index;
     for (index = 0; index < energyParameterDerivatives.size(); index++)
         if (param == energyParameterDerivatives[index])
@@ -159,10 +170,10 @@ static bool compareInt2(int2 a, int2 b) {
 }
 
 void CudaNonbondedUtilities::initialize(const System& system) {
-    string errorMessage = "Error initializing nonbonded utilities";    
+    string errorMessage = "Error initializing nonbonded utilities";
     if (atomExclusions.size() == 0) {
         // No exclusions were specifically requested, so just mark every atom as not interacting with itself.
-        
+
         atomExclusions.resize(context.getNumAtoms());
         for (int i = 0; i < (int) atomExclusions.size(); i++)
             atomExclusions[i].push_back(i);
@@ -239,7 +250,8 @@ void CudaNonbondedUtilities::initialize(const System& system) {
             }
         }
     }
-    atomExclusions.clear(); // We won't use this again, so free the memory it used
+    if (!spatial)
+        atomExclusions.clear(); // Spatial views retain original-ID exclusions.
     exclusions.upload(exclusionVec);
 
     // Create data structures for the neighbor list.
@@ -265,7 +277,9 @@ void CudaNonbondedUtilities::initialize(const System& system) {
         sortedBlocks.initialize<unsigned int>(context, numAtomBlocks, "sortedBlocks");
         sortedBlockCenter.initialize(context, numAtomBlocks+1, 4*elementSize, "sortedBlockCenter");
         sortedBlockBoundingBox.initialize(context, numAtomBlocks+1, 4*elementSize, "sortedBlockBoundingBox");
-        numBlockSizes = min((context.getNumAtomBlocks()+63)/64, context.getNumThreadBlocks());
+        int boundsTileLanes = (spatial && spatial->gathersInBounds() ? spatial->getBoundsTileLanes() : 1);
+        int tilesPerBoundsBlock = 64/boundsTileLanes;
+        numBlockSizes = min((context.getNumAtomBlocks()+tilesPerBoundsBlock-1)/tilesPerBoundsBlock, context.getNumThreadBlocks());
         blockSizeRange.initialize(context, numBlockSizes, 2*elementSize, "blockSizeRange");
         largeBlockCenter.initialize(context, numAtomBlocks, 4*elementSize, "largeBlockCenter");
         largeBlockBoundingBox.initialize(context, numAtomBlocks, 4*elementSize, "largeBlockBoundingBox");
@@ -368,6 +382,27 @@ void CudaNonbondedUtilities::initialize(const System& system) {
         findInteractingBlocksArgs.push_back(&oldPositions.getDevicePointer());
         findInteractingBlocksArgs.push_back(&rebuildNeighborList.getDevicePointer());
     }
+    int nonbondedForces = 0;
+    canUseIndexedPositions = canOmitExcludedPairs && canUsePairList && energyParameterDerivatives.empty();
+    for (int i = 0; i < system.getNumForces(); i++) {
+        const Force& force = system.getForce(i);
+        if (const auto* nb = dynamic_cast<const NonbondedForce*>(&force)) {
+            nonbondedForces++;
+        }
+        else if (dynamic_cast<const CustomNonbondedForce*>(&force) != nullptr)
+            canUseIndexedPositions = false;
+    }
+    canUseIndexedPositions &= nonbondedForces == 1;
+    if (spatial)
+        spatial->initialize(system);
+    if (spatial && spatial->usesPackedExclusions()) {
+        // Spatial blocks already follow the atom curve; retain that traversal.
+        vector<unsigned int> blocks(numAtomBlocks);
+        for (int i = 0; i < numAtomBlocks; i++)
+            blocks[i] = i;
+        sortedBlocks.upload(blocks);
+    }
+
 }
 
 double CudaNonbondedUtilities::getMaxCutoffDistance() {
@@ -383,8 +418,13 @@ double CudaNonbondedUtilities::padCutoff(double cutoff) {
 }
 
 void CudaNonbondedUtilities::prepareInteractions(int forceGroups) {
+    spatialViewReady = false;
     if ((forceGroups&groupFlags) == 0)
         return;
+    if (spatial) {
+        spatial->prepare();
+        spatialViewReady = true;
+    }
     if (groupKernels.find(forceGroups) == groupKernels.end())
         createKernelsForGroups(forceGroups);
     KernelSet& kernels = groupKernels[forceGroups];
@@ -401,10 +441,14 @@ void CudaNonbondedUtilities::prepareInteractions(int forceGroups) {
 
     // Compute the neighbor list.
 
-    context.executeKernel(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], context.getNumAtomBlocks());
-    context.executeKernel(kernels.computeSortKeysKernel, &computeSortKeysArgs[0], context.getNumAtomBlocks());
-    blockSorter->sort(sortedBlocks);
-    context.executeKernel(kernels.sortBoxDataKernel, &sortBoxDataArgs[0], context.getNumAtoms());
+    // The allocation above and launch must describe the same number of blocks.
+    context.executeKernel(kernels.findBlockBoundsKernel, &findBlockBoundsArgs[0], numBlockSizes*64);
+    if (!(spatial && spatial->usesPackedExclusions())) {
+        context.executeKernel(kernels.computeSortKeysKernel, &computeSortKeysArgs[0], context.getNumAtomBlocks());
+        blockSorter->sort(sortedBlocks);
+    }
+    if (!(spatial && spatial->usesPackedExclusions() && spatial->gathersInBounds()) || useLargeBlocks)
+        context.executeKernel(kernels.sortBoxDataKernel, &sortBoxDataArgs[0], context.getNumAtoms());
     context.executeKernel(kernels.findInteractingBlocksKernel, &findInteractingBlocksArgs[0], context.getNumAtoms(), 256);
     forceRebuildNeighborList = false;
     interactionCount.download(pinnedCountBuffer, false);
@@ -413,8 +457,8 @@ void CudaNonbondedUtilities::prepareInteractions(int forceGroups) {
 
 void CudaNonbondedUtilities::initParamArgs() {
     int index = paramStartIndex;
-    for (ComputeParameterInfo& param : parameters)
-        forceArgs[index++] = &context.unwrap(param.getArray()).getDevicePointer();
+    for (int i = 0; i < parameters.size(); i++)
+        forceArgs[index++] = &(spatial ? spatial->parameters[i]->getDevicePointer() : context.unwrap(parameters[i].getArray()).getDevicePointer());
     for (ComputeParameterInfo& arg : arguments)
         forceArgs[index++] = &context.unwrap(arg.getArray()).getDevicePointer();
     hasInitializedParams = true;
@@ -430,7 +474,14 @@ void CudaNonbondedUtilities::computeInteractions(int forceGroups, bool includeFo
             kernel = createInteractionKernel(kernels.source, parameters, arguments, true, true, forceGroups, includeForces, includeEnergy);
         if (!hasInitializedParams)
             initParamArgs();
+        if (spatial) {
+            if (!spatial->usesPackedExclusions() && !spatial->usesDirectForces())
+                getSpatialWorkView(includeForces);
+            else
+                spatial->gatherParameters(includeForces);
+        }
         context.executeKernel(kernel, &forceArgs[0], numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
+
     }
     if (useNeighborList && numTiles > 0) {
         cuEventSynchronize(downloadCountEvent);
@@ -441,10 +492,14 @@ void CudaNonbondedUtilities::computeInteractions(int forceGroups, bool includeFo
 bool CudaNonbondedUtilities::updateNeighborListSize() {
     if (!useCutoff)
         return false;
-    if (context.getStepsSinceReorder() == 0 || tilesAfterReorder == 0)
-        tilesAfterReorder = pinnedCountBuffer[0];
-    else if (context.getStepsSinceReorder() > 25 && pinnedCountBuffer[0] > 1.1*tilesAfterReorder)
-        context.forceReorder();
+
+    if (!spatial) {
+        if (context.getStepsSinceReorder() == 0 || tilesAfterReorder == 0)
+            tilesAfterReorder = pinnedCountBuffer[0];
+        else if (context.getStepsSinceReorder() > 25 && pinnedCountBuffer[0] > 1.1*tilesAfterReorder) {
+            context.forceReorder();
+        }
+    }
     if (pinnedCountBuffer[0] <= maxTiles && pinnedCountBuffer[1] <= maxSinglePairs)
         return false;
 
@@ -459,6 +514,7 @@ bool CudaNonbondedUtilities::updateNeighborListSize() {
             maxTiles = totalTiles;
         interactingTiles.resize(maxTiles);
         interactingAtoms.resize(CudaContext::TileSize*(size_t) maxTiles);
+        if (spatial) spatial->resizeNeighborMasks();
         if (forceArgs.size() > 0)
             forceArgs[7] = &interactingTiles.getDevicePointer();
         findInteractingBlocksArgs[6] = &interactingTiles.getDevicePointer();
@@ -477,6 +533,8 @@ bool CudaNonbondedUtilities::updateNeighborListSize() {
     context.setForcesValid(false);
     return true;
 }
+
+
 
 void CudaNonbondedUtilities::setUsePadding(bool padding) {
     usePadding = padding;
@@ -520,13 +578,26 @@ void CudaNonbondedUtilities::createKernelsForGroups(int groups) {
         if (useLargeBlocks)
             defines["USE_LARGE_BLOCKS"] = "1";
         defines["MAX_EXCLUSIONS"] = context.intToString(maxExclusions);
+        if (spatial) defines["SPATIAL_ATOM_ORDER"] = "1";
+        if (spatial && spatial->usesPackedExclusions()) defines["PACKED_EXCLUSIONS"] = "1";
+        if (spatial && spatial->usesExclusionFilter()) defines["EXCLUSION_BLOCK_FILTER"] = "1";
+        if (spatial && spatial->gathersInBounds()) {
+            defines["GATHER_SPATIAL_BOUNDS"] = "1";
+            defines["BOUNDS_TILE_LANES"] = context.intToString(spatial->getBoundsTileLanes());
+            if (spatial->usesPackedExclusions())
+                defines["SPATIAL_BLOCK_TRAVERSAL"] = "1";
+            if (!spatial->usesDirectForces()) defines["CLEAR_SPATIAL_FORCES"] = "1";
+        }
         defines["MAX_BITS_FOR_PAIRS"] = (canUsePairList ? (context.getComputeCapability() < 8.0 ? "2" : "3") : "0");
         int binShift = 1;
         while (1<<binShift <= context.getNumAtomBlocks())
             binShift++;
         defines["BIN_SHIFT"] = context.intToString(binShift);
         defines["BLOCK_INDEX_MASK"] = context.intToString((1<<binShift)-1);
-        CUmodule interactingBlocksProgram = context.createModule(CudaKernelSources::vectorOps+CudaKernelSources::findInteractingBlocks, defines);
+        string neighborSource = CudaKernelSources::vectorOps+CudaKernelSources::findInteractingBlocks;
+        if (spatial && spatial->usesExclusionFilter())
+            neighborSource = CommonKernelSources::spatialExclusionFilter+neighborSource;
+        CUmodule interactingBlocksProgram = context.createModule(neighborSource, defines);
         kernels.findBlockBoundsKernel = context.getKernel(interactingBlocksProgram, "findBlockBounds");
         kernels.computeSortKeysKernel = context.getKernel(interactingBlocksProgram, "computeSortKeys");
         kernels.sortBoxDataKernel = context.getKernel(interactingBlocksProgram, "sortBoxData");
@@ -537,7 +608,6 @@ void CudaNonbondedUtilities::createKernelsForGroups(int groups) {
 
 CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source, vector<ComputeParameterInfo>& params, vector<ComputeParameterInfo>& arguments, bool useExclusions, bool isSymmetric, int groups, bool includeForces, bool includeEnergy) {
     map<string, string> replacements;
-    replacements["COMPUTE_INTERACTION"] = source;
     const string suffixes[] = {"x", "y", "z", "w"};
     stringstream localData;
     int localDataSize = 0;
@@ -570,6 +640,12 @@ CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source,
     }
     if (energyParameterDerivatives.size() > 0)
         args << ", mixed* __restrict__ energyParamDerivs";
+    if (spatial)
+        args << ", const int* spatialExclusionCount";
+    if (spatial && spatial->usesPackedExclusions())
+        args << ", const unsigned int* __restrict__ spatialNeighborMasks";
+    if (spatial && spatial->usesDirectForces())
+        args << ", const int* __restrict__ spatialForceOrder";
     replacements["PARAMETER_ARGUMENTS"] = args.str();
 
     stringstream load1;
@@ -600,8 +676,8 @@ CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source,
         }
     }
     replacements["BROADCAST_WARP_DATA"] = broadcastWarpData.str();
-    
-    // Part 2. Defines for off-diagonal exclusions, and neighborlist tiles. 
+
+    // Part 2. Defines for off-diagonal exclusions, and neighborlist tiles.
     stringstream declareLocal2;
     for (const ComputeParameterInfo& param : params)
         declareLocal2<<param.getType()<<" shfl"<<param.getName()<<";\n";
@@ -611,7 +687,7 @@ CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source,
     for (const ComputeParameterInfo& param : params)
         loadLocal2<<"shfl"<<param.getName()<<" = global_"<<param.getName()<<"[j];\n";
     replacements["LOAD_LOCAL_PARAMETERS_FROM_GLOBAL"] = loadLocal2.str();
-   
+
     stringstream load2j;
     for (const ComputeParameterInfo& param : params)
         load2j<<param.getType()<<" "<<param.getName()<<"2 = shfl"<<param.getName()<<";\n";
@@ -621,7 +697,7 @@ CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source,
     for (const ComputeParameterInfo& param : params)
         load2g<<param.getType()<<" "<<param.getName()<<"2 = global_"<<param.getName()<<"[atom2];\n";
     replacements["LOAD_ATOM2_PARAMETERS_FROM_GLOBAL"] = load2g.str();
-    
+
     stringstream clearLocal;
     for (const ComputeParameterInfo& param : params) {
         clearLocal<<"shfl"<<param.getName()<<" = ";
@@ -667,19 +743,44 @@ CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source,
         }
     }
     replacements["SHUFFLE_WARP_DATA"] = shuffleWarpData.str();
+    map<string, string> subtileShuffle;
+    subtileShuffle["tgx+1"] = "((tgx & ~7u) | ((tgx+1) & 7u))";
+    replacements["SHUFFLE_EXCLUSION_SUBTILE_DATA"] = context.replaceStrings(shuffleWarpData.str(), subtileShuffle);
 
     map<string, string> defines;
     if (useCutoff)
         defines["USE_CUTOFF"] = "1";
+    if (spatial && spatial->usesDirectForces())
+        defines["DIRECT_SPATIAL_FORCES"] = "1";
+    if (spatial && spatial->usesIndexedPositions())
+        defines["INDEXED_SPATIAL_POSITIONS"] = "1";
+    if (spatial && spatial->usesIdentityOrder())
+        defines["IDENTITY_SPATIAL_ORDER"] = "1";
     if (usePeriodic)
         defines["USE_PERIODIC"] = "1";
     if (useExclusions)
         defines["USE_EXCLUSIONS"] = "1";
+    replacements["COMPUTE_INTERACTION"] = source;
+    replacements["COMPUTE_EXCLUSION_INTERACTION"] = source;
+    replacements["COMPUTE_PAIR_INTERACTION"] = source;
+
     if (isSymmetric)
         defines["USE_SYMMETRIC"] = "1";
     if (useNeighborList)
         defines["USE_NEIGHBOR_LIST"] = "1";
+    if (spatial && spatial->usesPackedExclusions()) {
+        defines["PACKED_EXCLUSIONS"] = "1";
+        defines["DIAGONAL_EXCLUSION_TILES"] = "1";
+        if (context.getUseDoublePrecision())
+            defines["GUARD_NONBONDED_ARITHMETIC"] = "1";
+    }
+    // Reuse the ordinary tile's conservative periodic-copy criterion for
+    // exclusion tiles. It needs the current block bounds from a neighbor list.
+    if (spatial && usePeriodic && useNeighborList)
+        defines["EXCLUSION_LOCALITY"] = "1";
     defines["ENABLE_SHUFFLE"] = "1";
+    if (context.getPlatformData().deterministicForces)
+        defines["DETERMINISTIC_FORCES"] = "1";
     if (includeForces)
         defines["INCLUDE_FORCES"] = "1";
     if (includeEnergy)
@@ -706,13 +807,71 @@ CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source,
     int endExclusionIndex = (context.getContextIndex()+1)*numExclusionTiles/numContexts;
     defines["FIRST_EXCLUSION_TILE"] = context.intToString(startExclusionIndex);
     defines["LAST_EXCLUSION_TILE"] = context.intToString(endExclusionIndex);
+    if (spatial && !spatial->usesIdentityOrder()) {
+        defines["NUM_TILES_WITH_EXCLUSIONS"] = "spatialExclusionCount[0]";
+        defines["FIRST_EXCLUSION_TILE"] = "0";
+        defines["LAST_EXCLUSION_TILE"] = "spatialExclusionCount[0]";
+    }
     if ((localDataSize/4)%2 == 0 && !context.getUseDoublePrecision())
         defines["PARAMETER_SIZE_IS_EVEN"] = "1";
-    CUmodule program = context.createModule(CudaKernelSources::vectorOps+context.replaceStrings(kernelSource, replacements), defines);
+    string kernelTemplate = kernelSource;
+
+    CUmodule program = context.createModule(CudaKernelSources::vectorOps+context.replaceStrings(kernelTemplate, replacements), defines);
     CUfunction kernel = context.getKernel(program, "computeNonbonded");
+
     return kernel;
 }
 
 void CudaNonbondedUtilities::setKernelSource(const string& source) {
     kernelSource = source;
+}
+
+void CudaNonbondedUtilities::finishSpatialForces() {
+    spatialViewReady = false;
+    if (spatial)
+        spatial->mergeForces();
+}
+
+ArrayInterface* CudaNonbondedUtilities::getInverseSpatialAtomOrder() {
+    return spatial && spatial->getReorderCount() > 0 ? &spatial->getInverseAtomOrder() : nullptr;
+}
+
+ArrayInterface* CudaNonbondedUtilities::getReorderedParameterArray(ArrayInterface& original) {
+    if (!spatial || spatial->getReorderCount() == 0)
+        return nullptr;
+    if (!original.isInitialized() || &original.getContext() != &context)
+        throw OpenMMException("Spatial parameter source must belong to this ComputeContext");
+    for (const auto& entry : context.getReorderedArraySet().getEntries())
+        if (&context.unwrap(original) == entry.original)
+            return entry.sorted;
+    return nullptr;
+}
+
+void CudaNonbondedUtilities::invalidateSpatialParameters() {
+    if (spatial)
+        spatial->invalidateParameters();
+}
+
+
+
+
+
+
+
+
+
+SpatialNonbondedView CudaNonbondedUtilities::getSpatialWorkView(bool includeForces) {
+    if (!spatial || !spatialViewReady)
+        throw OpenMMException("Spatial work is only available during an active nonbonded evaluation");
+    if (spatial->usesPackedExclusions() || spatial->usesDirectForces())
+        throw OpenMMException("Spatial work view requires full exclusion tiles and buffered forces");
+    spatial->gatherParameters(includeForces);
+    return {&spatial->positions, &spatial->forces,
+        &spatial->getAtomOrder(), &spatial->getInverseAtomOrder(),
+        &exclusionTiles, &exclusions, &spatial->exclusionCount,
+        &exclusionRowIndices, &exclusionIndices,
+        useNeighborList ? &interactingTiles : nullptr,
+        useNeighborList ? &interactingAtoms : nullptr,
+        useNeighborList ? &interactionCount : nullptr, useNeighborList ? &singlePairs : nullptr,
+        context.getNumAtoms(), context.getPaddedNumAtoms(), spatial->getReorderCount(), useNeighborList};
 }

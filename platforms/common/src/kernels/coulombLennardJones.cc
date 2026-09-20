@@ -1,6 +1,11 @@
 {
 #if USE_EWALD
     unsigned int includeInteraction = (!isExcluded && r2 < CUTOFF_SQUARED);
+#ifdef GUARD_NONBONDED_ARITHMETIC
+    // This force's exact inclusion test guards arithmetic only. The enclosing
+    // kernel must still execute all lane communication and force accumulation.
+    if (includeInteraction) {
+#endif
     const real alphaR = EWALD_ALPHA*r;
     const real expAlphaRSqr = EXP(-alphaR*alphaR);
 #if HAS_COULOMB
@@ -74,11 +79,17 @@
     tempEnergy += includeInteraction ? prefactor*erfcAlphaR : 0;
 #endif
     dEdR += includeInteraction ? tempForce*invR*invR : 0;
+#ifdef GUARD_NONBONDED_ARITHMETIC
+    }
+#endif
 #else
 #ifdef USE_CUTOFF
     unsigned int includeInteraction = (!isExcluded && r2 < CUTOFF_SQUARED);
 #else
     unsigned int includeInteraction = (!isExcluded);
+#endif
+#ifdef GUARD_NONBONDED_ARITHMETIC
+    if (includeInteraction) {
 #endif
     real tempForce = 0.0f;
 #if HAS_LENNARD_JONES
@@ -112,5 +123,8 @@
   #endif
 #endif
     dEdR += includeInteraction ? tempForce*invR*invR : 0;
+#ifdef GUARD_NONBONDED_ARITHMETIC
+    }
+#endif
 #endif
 }

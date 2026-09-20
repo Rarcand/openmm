@@ -353,7 +353,7 @@ void CommonUpdateStateDataKernel::setPeriodicBoxVectors(ContextImpl& context, co
 
 void CommonUpdateStateDataKernel::createCheckpoint(ContextImpl& context, ostream& stream) {
     ContextSelector selector(cc);
-    int version = 3;
+    int version = cc.getNonbondedUtilities().getUsesStableAtomOrder() ? 4 : 3;
     stream.write((char*) &version, sizeof(int));
     int precision = (cc.getUseDoublePrecision() ? 2 : cc.getUseMixedPrecision() ? 1 : 0);
     stream.write((char*) &precision, sizeof(int));
@@ -363,6 +363,10 @@ void CommonUpdateStateDataKernel::createCheckpoint(ContextImpl& context, ostream
     stream.write((char*) &stepCount, sizeof(long long));
     int stepsSinceReorder = cc.getStepsSinceReorder();
     stream.write((char*) &stepsSinceReorder, sizeof(int));
+    if (version == 4) {
+        int stepsSinceRecenter = cc.getStepsSinceStableRecenter();
+        stream.write((char*) &stepsSinceRecenter, sizeof(int));
+    }
     char* buffer = (char*) cc.getPinnedBuffer();
     cc.getPosq().download(buffer);
     stream.write(buffer, cc.getPosq().getSize()*cc.getPosq().getElementSize());
@@ -385,8 +389,9 @@ void CommonUpdateStateDataKernel::loadCheckpoint(ContextImpl& context, istream& 
     ContextSelector selector(cc);
     int version;
     stream.read((char*) &version, sizeof(int));
-    if (version != 3)
+    if (version != 3 && version != 4)
         throw OpenMMException("Checkpoint was created with a different version of OpenMM");
+
     int precision;
     stream.read((char*) &precision, sizeof(int));
     int expectedPrecision = (cc.getUseDoublePrecision() ? 2 : cc.getUseMixedPrecision() ? 1 : 0);
@@ -398,11 +403,15 @@ void CommonUpdateStateDataKernel::loadCheckpoint(ContextImpl& context, istream& 
     stream.read((char*) &stepCount, sizeof(long long));
     int stepsSinceReorder;
     stream.read((char*) &stepsSinceReorder, sizeof(int));
+    int stepsSinceRecenter = 99999;
+    if (version == 4)
+        stream.read((char*) &stepsSinceRecenter, sizeof(int));
     vector<ComputeContext*> contexts = cc.getAllContexts();
     for (auto ctx : contexts) {
         ctx->setTime(time);
         ctx->setStepCount(stepCount);
         ctx->setStepsSinceReorder(stepsSinceReorder);
+        ctx->setStepsSinceStableRecenter(stepsSinceRecenter);
     }
     char* buffer = (char*) cc.getPinnedBuffer();
     stream.read(buffer, cc.getPosq().getSize()*cc.getPosq().getElementSize());
@@ -422,9 +431,22 @@ void CommonUpdateStateDataKernel::loadCheckpoint(ContextImpl& context, istream& 
         ctx->setPeriodicBoxVectors(boxVectors[0], boxVectors[1], boxVectors[2]);
     cc.getIntegrationUtilities().loadCheckpoint(stream);
     SimTKOpenMMUtilities::loadCheckpoint(stream);
-    for (auto listener : cc.getReorderListeners())
-        listener->execute();
-    cc.validateAtomOrder();
+    // A preserved-state reinitialization can change the selected ordering mode.
+    bool normalized = false;
+    if (cc.getNonbondedUtilities().getUsesStableAtomOrder()) {
+        for (int i = 0; i < cc.getNumAtoms(); i++) {
+            if (cc.getAtomIndex()[i] != i) {
+                cc.validateAtomOrder();
+                normalized = true;
+                break;
+            }
+        }
+    }
+    if (!normalized) {
+        for (auto listener : cc.getReorderListeners())
+            listener->execute();
+        cc.validateAtomOrder();
+    }
 }
 
 void CommonApplyConstraintsKernel::initialize(const System& system) {
@@ -1724,6 +1746,13 @@ void CommonCalcCustomCentroidBondForceKernel::initialize(const System& system, c
     for (int i = 0; i < numBonds; i++) {
         vector<int> groups;
         force.getBondParameters(i, groups, paramVector[i]);
+        if (cc.getNonbondedUtilities().getUsesStableAtomOrder()) {
+            vector<int> atoms;
+            for (int group : groups)
+                atoms.insert(atoms.end(), groupParticleVec.begin()+groupOffsetVec[group],
+                             groupParticleVec.begin()+groupOffsetVec[group+1]);
+            cc.registerRecenterGroup(atoms);
+        }
         for (int j = 0; j < groups.size(); j++)
             bondGroupVec[i+j*numBonds] = groups[j];
     }

@@ -291,7 +291,14 @@ void CommonCalcCustomNonbondedForceKernel::initialize(const System& system, cons
     if (force.getNumInteractionGroups() > 0)
         initInteractionGroups(force, source, tableTypes);
     else {
-        cc.getNonbondedUtilities().addInteraction(useCutoff, usePeriodic, true, force.getCutoffDistance(), exclusionList, source, force.getForceGroup(), numParticles > 2000);
+        // The generated interaction depends only on the two particles, their
+        // registered parameters, and shared arguments.  The sparse-pair path
+        // supplies those inputs and interactionScale=1, including for switching
+        // and energy parameter derivatives.  The generated source encloses all
+        // pair contributions in !isExcluded, so a neighbor representation may
+        // also omit excluded pairs entirely. Interaction groups use their own
+        // execution path above and do not register this capability here.
+        cc.getNonbondedUtilities().addInteraction(useCutoff, usePeriodic, true, force.getCutoffDistance(), exclusionList, source, force.getForceGroup(), numParticles > 2000, cc.getNonbondedUtilities().getUsesStableAtomOrder(), true);
         for (int i = 0; i < paramBuffers.size(); i++)
             cc.getNonbondedUtilities().addParameter(ComputeParameterInfo(paramBuffers[i].getArray(), prefix+"params"+cc.intToString(i+1),
                     paramBuffers[i].getComponentType(), paramBuffers[i].getNumComponents()));
@@ -355,6 +362,23 @@ void CommonCalcCustomNonbondedForceKernel::initialize(const System& system, cons
             computedValuesKernel->addArg(parameter.getArray());
         for (auto& function : tabulatedFunctionArrays)
             computedValuesKernel->addArg(function);
+        if (force.getNumInteractionGroups() == 0 && !computedValueBuffers.empty()) {
+            // Preserve original-order outputs and optionally scatter a second
+            // copy into the spatial view in this same producer launch.
+            string spatialArgs = ", GLOBAL const int* inverseOrder";
+            string spatialWrites;
+            for (int i = 0; i < computedValueBuffers.size(); i++) {
+                int originalIndex = 0;
+                while (&computedValues->getParameterInfos().at(originalIndex).getArray() != &computedValueBuffers[i].getArray())
+                    originalIndex++;
+                string name = "spatial_values"+cc.intToString(i+1);
+                spatialArgs += ", GLOBAL "+computedValueBuffers[i].getType()+"* "+name;
+                spatialWrites += name+"[inverseOrder[index]] = local_values"+cc.intToString(originalIndex+1)+";\n";
+            }
+            replacements["PARAMETER_ARGUMENTS"] += spatialArgs;
+            replacements["COMPUTE_VALUES"] += spatialWrites;
+            spatialComputedValuesSource = cc.replaceStrings(CommonKernelSources::customNonbondedComputedValues, replacements);
+        }
     }
     info = new ForceInfo(force);
     cc.addForce(info);
@@ -664,8 +688,42 @@ double CommonCalcCustomNonbondedForceKernel::execute(ContextImpl& context, bool 
             hasInitializedLongRangeCorrection = false;
     }
     if (computedValues != NULL) {
-        computedValuesKernel->setArg(computedValues->getParameterInfos().size(), cc.getGlobalParamValues());
+        if (!hasInitializedComputedValuesKernel) {
+            // Views are ready only after nonbonded initialization and the
+            // first prepareInteractions(), not during Force initialization.
+            ArrayInterface* inverse = cc.getNonbondedUtilities().getInverseSpatialAtomOrder();
+            if (!spatialComputedValuesSource.empty() && inverse != NULL) {
+                map<string, string> defines;
+                defines["NUM_ATOMS"] = cc.intToString(cc.getNumAtoms());
+                ComputeProgram program = cc.compileProgram(spatialComputedValuesSource, defines);
+                ComputeKernel kernel = program->createKernel("computePerParticleValues");
+                for (auto& value : computedValues->getParameterInfos())
+                    kernel->addArg(value.getArray());
+                if (needGlobalParams)
+                    kernel->addArg();
+                for (auto& parameter : params->getParameterInfos())
+                    kernel->addArg(parameter.getArray());
+                for (auto& function : tabulatedFunctionArrays)
+                    kernel->addArg(function);
+                kernel->addArg(*inverse);
+                for (auto& value : computedValueBuffers) {
+                    ArrayInterface* sorted = cc.getNonbondedUtilities().getReorderedParameterArray(value.getArray());
+                    if (sorted == NULL)
+                        throw OpenMMException("Missing spatial view for a computed nonbonded parameter");
+                    kernel->addArg(*sorted);
+                }
+                computedValuesKernel = kernel;
+                computesSortedValues = true;
+            }
+            hasInitializedComputedValuesKernel = true;
+        }
+        if (needGlobalParams)
+            computedValuesKernel->setArg(computedValues->getParameterInfos().size(), cc.getGlobalParamValues());
         computedValuesKernel->execute(cc.getNumAtoms());
+        // The default pair kernel consumes sorted copies, while this producer
+        // writes stable atom-ID arrays.  Gather only after all producers finish.
+        if (!interactionGroupData.isInitialized() && !computesSortedValues && !computedValueBuffers.empty())
+            cc.getNonbondedUtilities().invalidateSpatialParameters();
     }
     if (interactionGroupData.isInitialized()) {
         if (!hasInitializedKernel) {
@@ -737,6 +795,8 @@ void CommonCalcCustomNonbondedForceKernel::copyParametersToContext(ContextImpl& 
                 paramVector[i][j] = (float) parameters[j];
         }
         params->setParameterValuesSubset(firstParticle, paramVector);
+        if (!interactionGroupData.isInitialized())
+            cc.getNonbondedUtilities().invalidateSpatialParameters();
     }
 
     // See if any tabulated functions have changed.

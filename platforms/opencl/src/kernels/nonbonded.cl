@@ -39,7 +39,13 @@ __kernel void computeNonbonded(
     for (int pos = firstExclusionTile; pos < lastExclusionTile; pos++) {
         const int2 tileIndices = exclusionTiles[pos];
         const unsigned int x = tileIndices.x;
+#ifdef DIAGONAL_EXCLUSION_TILES
+        // The representation guarantees x == y for every entry. Exposing that
+        // invariant lets the compiler remove all off-diagonal code and state.
+        const unsigned int y = x;
+#else
         const unsigned int y = tileIndices.y;
+#endif
         real4 force = 0;
         unsigned int atom1 = x*TILE_SIZE + tgx;
         real4 posq1 = posq[atom1];
@@ -80,7 +86,7 @@ __kernel void computeNonbonded(
 #endif
                 real tempEnergy = 0;
                 const real interactionScale = 0.5f;
-                COMPUTE_INTERACTION
+                COMPUTE_EXCLUSION_INTERACTION
                 energy += 0.5f*tempEnergy;
 #ifdef INCLUDE_FORCES
 #ifdef USE_SYMMETRIC
@@ -139,7 +145,7 @@ __kernel void computeNonbonded(
 #endif
                     real tempEnergy = 0;
                     const real interactionScale = 1.0f;
-                    COMPUTE_INTERACTION
+                    COMPUTE_EXCLUSION_INTERACTION
                     energy += tempEnergy;
 #ifdef INCLUDE_FORCES
 #ifdef USE_SYMMETRIC
@@ -198,11 +204,18 @@ __kernel void computeNonbonded(
     int skipBase = 0;
     int currentSkipIndex = tbx;
     __local int atomIndices[FORCE_WORK_GROUP_SIZE];
+#ifdef PACKED_EXCLUSIONS
+    __local unsigned int partnerExclusions[FORCE_WORK_GROUP_SIZE];
+#endif
     __local volatile int skipTiles[FORCE_WORK_GROUP_SIZE];
     skipTiles[get_local_id(0)] = -1;
 
     while (pos < end) {
+#ifdef PACKED_EXCLUSIONS
+        const bool hasExclusions = true;
+#else
         const bool hasExclusions = false;
+#endif
         real4 force = 0;
         bool includeTile = true;
 
@@ -211,7 +224,11 @@ __kernel void computeNonbonded(
         int x, y;
         bool singlePeriodicCopy = false;
 #ifdef USE_NEIGHBOR_LIST
+#ifdef PACKED_EXCLUSIONS
+        x = tiles[pos]&0x7fffffff;
+#else
         x = tiles[pos];
+#endif
         real4 blockSizeX = blockSize[x];
         singlePeriodicCopy = (0.5f*periodicBoxSize.x-blockSizeX.x >= MAX_CUTOFF &&
                               0.5f*periodicBoxSize.y-blockSizeX.y >= MAX_CUTOFF &&
@@ -244,6 +261,7 @@ __kernel void computeNonbonded(
         includeTile = (skipTiles[currentSkipIndex] != pos);
 #endif
         if (includeTile) {
+            // BEGIN_SPATIAL_TILE
             unsigned int atom1 = x*TILE_SIZE + tgx;
 
             // Load atom data for this tile.
@@ -256,6 +274,9 @@ __kernel void computeNonbonded(
             unsigned int j = y*TILE_SIZE + tgx;
 #endif
             atomIndices[get_local_id(0)] = j;
+#ifdef PACKED_EXCLUSIONS
+            partnerExclusions[get_local_id(0)] = neighborMasks[pos*TILE_SIZE+tgx];
+#endif
             if (j < PADDED_NUM_ATOMS) {
                 real4 tempPosq = posq[j];
                 localData[localAtomIndex].x = tempPosq.x;
@@ -304,6 +325,9 @@ __kernel void computeNonbonded(
 #endif
 #ifdef USE_EXCLUSIONS
                         bool isExcluded = (atom1 >= NUM_ATOMS || atom2 >= NUM_ATOMS);
+#ifdef PACKED_EXCLUSIONS
+                        isExcluded |= ((partnerExclusions[tbx+tj] & (1u<<tgx)) != 0);
+#endif
 #endif
                         real tempEnergy = 0;
                         const real interactionScale = 1.0f;
@@ -359,6 +383,9 @@ __kernel void computeNonbonded(
 #endif
 #ifdef USE_EXCLUSIONS
                         bool isExcluded = (atom1 >= NUM_ATOMS || atom2 >= NUM_ATOMS);
+#ifdef PACKED_EXCLUSIONS
+                        isExcluded |= ((partnerExclusions[tbx+tj] & (1u<<tgx)) != 0);
+#endif
 #endif
                         real tempEnergy = 0;
                         const real interactionScale = 1.0f;
@@ -403,8 +430,11 @@ __kernel void computeNonbonded(
                 ATOMIC_ADD(&forceBuffers[atom2+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[get_local_id(0)].fz));
             }
 #endif
+            // END_SPATIAL_TILE
         }
+#ifndef PACKED_EXCLUSIONS
         pos++;
+#endif
     }
 #ifdef INCLUDE_ENERGY
     energyBuffer[get_global_id(0)] += energy;

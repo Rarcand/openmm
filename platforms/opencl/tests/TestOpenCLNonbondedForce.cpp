@@ -54,7 +54,48 @@ bool canRunHugeTest() {
     return (memory >= 8*(long long)(1<<30));
 }
 
+void testSpatialBoxChange() {
+    System system;
+    system.setDefaultPeriodicBoxVectors(Vec3(9, 0, 0), Vec3(0, 9, 0), Vec3(0, 0, 9));
+    NonbondedForce* force = new NonbondedForce();
+    force->setNonbondedMethod(NonbondedForce::PME);
+    force->setCutoffDistance(1.0);
+    force->setEwaldErrorTolerance(1e-5);
+    vector<Vec3> positions;
+    for (int i = 0; i < 3001; i++) {
+        system.addParticle(40);
+        force->addParticle(i%2 == 0 ? 0.05 : -0.05, 0.25, 0.01);
+        int j = (73*i)%3001;
+        positions.push_back(Vec3(0.2+0.52*(j%15), 0.2+0.52*((j/15)%15), 0.2+0.52*(j/225)));
+    }
+    system.addForce(force);
+    VerletIntegrator integrator(0.001), referenceIntegrator(0.001);
+    Context context(system, integrator, platform);
+    if (platform.getPropertyValue(context, "AtomReorderingStatus") != "spatial")
+        return;
+    Context reference(system, referenceIntegrator, Platform::getPlatformByName("Reference"));
+    context.setPositions(positions);
+    reference.setPositions(positions);
+    context.getState(State::Forces);
+    // Changing the box can introduce neighbors even when no atom has moved.
+    for (double size : {8.1, 9.0, 8.55}) {
+        context.setPeriodicBoxVectors(Vec3(size, 0, 0), Vec3(0, size, 0), Vec3(0, 0, size));
+        reference.setPeriodicBoxVectors(Vec3(size, 0, 0), Vec3(0, size, 0), Vec3(0, 0, size));
+        State actual = context.getState(State::Forces | State::Energy);
+        State expected = reference.getState(State::Forces | State::Energy);
+        double error = 0, norm = 0;
+        for (int i = 0; i < system.getNumParticles(); i++) {
+            Vec3 delta = actual.getForces()[i]-expected.getForces()[i];
+            error += delta.dot(delta);
+            norm += expected.getForces()[i].dot(expected.getForces()[i]);
+        }
+        ASSERT(sqrt(error/norm) < 1e-5);
+        ASSERT_EQUAL_TOL(expected.getPotentialEnergy(), actual.getPotentialEnergy(), 1e-5);
+    }
+}
+
 void runPlatformTests() {
+    testSpatialBoxChange();
     testParallelComputation(NonbondedForce::NoCutoff);
     testParallelComputation(NonbondedForce::Ewald);
     testParallelComputation(NonbondedForce::PME);

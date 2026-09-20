@@ -35,6 +35,9 @@ BondedUtilities::BondedUtilities(ComputeContext& context) : context(context), nu
 
 void BondedUtilities::addInteraction(const vector<vector<int> >& atoms, const string& source, int group) {
     if (atoms.size() > 0) {
+        if (context.getNonbondedUtilities().getUsesStableAtomOrder())
+            for (const auto& groupAtoms : atoms)
+                context.registerRecenterGroup(groupAtoms);
         forceAtoms.push_back(atoms);
         forceSource.push_back(source);
         forceGroup.push_back(group);

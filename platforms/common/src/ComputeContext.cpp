@@ -24,6 +24,8 @@
 
 #include "openmm/common/ComputeContext.h"
 #include "openmm/common/ContextSelector.h"
+#include "openmm/common/ReorderedArraySet.h"
+#include "CommonKernelSources.h"
 #include "openmm/System.h"
 #include "openmm/VirtualSite.h"
 #include "openmm/internal/ContextImpl.h"
@@ -32,6 +34,8 @@
 #include "hilbert.h"
 #include <algorithm>
 #include <cmath>
+#include <numeric>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <unordered_set>
@@ -46,6 +50,8 @@ const int ComputeContext::TileSize = 32;
 ComputeContext::ComputeContext(const System& system) : system(system), time(0.0), stepCount(0), computeForceCount(0), stepsSinceReorder(99999),
         forceNextReorder(false), atomsWereReordered(false), forcesValid(false), hasInitializedGlobals(false), hasAssignedPosqCharges(false) {
     workThread = new WorkThread();
+    stepsSinceStableRecenter = 99999;
+    stableRecenterCount = 0;
 }
 
 ComputeContext::~ComputeContext() {
@@ -99,6 +105,23 @@ void ComputeContext::initializeKernels() {
     setChargesKernel->addArg(getPosq());
     setChargesKernel->addArg(getAtomIndexArray());
     setChargesKernel->addArg(numAtoms);
+}
+
+ReorderedArraySet& ComputeContext::getReorderedArraySet() {
+    if (!getNonbondedUtilities().getUsesStableAtomOrder())
+        throw OpenMMException("Reordered array registration requires stable original atom IDs");
+    if (!reorderedArrays)
+        reorderedArrays.reset(new ReorderedArraySet(*this, numAtoms, paddedNumAtoms));
+    return *reorderedArrays;
+}
+
+void ComputeContext::addReorderedArray(ArrayInterface& original, ArrayInterface& spatial) {
+    getReorderedArraySet().addArray(original, spatial);
+}
+
+void ComputeContext::invalidateReorderedArrays() {
+    if (reorderedArrays)
+        reorderedArrays->invalidate();
 }
 
 ComputeQueue ComputeContext::getCurrentQueue() {
@@ -372,6 +395,10 @@ private:
 };
 
 void ComputeContext::findMoleculeGroups() {
+    // Stable-ID execution does not exchange identical molecules. Its periodic
+    // translation groups are registered independently of ForceInfo equality.
+    if (getNonbondedUtilities().getUsesStableAtomOrder())
+        return;
     // The first time this is called, we need to identify all the molecules in the system.
 
     if (moleculeGroups.size() == 0) {
@@ -521,7 +548,7 @@ void ComputeContext::invalidateMolecules() {
 }
 
 bool ComputeContext::invalidateMolecules(ComputeForceInfo* force, bool checkAtoms, bool checkGroups) {
-    if (numAtoms == 0 || !getNonbondedUtilities().getUseCutoff())
+    if (getNonbondedUtilities().getUsesStableAtomOrder() || numAtoms == 0 || !getNonbondedUtilities().getUseCutoff())
         return false;
     bool valid = true;
     int forceIndex = -1;
@@ -643,6 +670,15 @@ void ComputeContext::resetAtomOrder() {
 }
 
 void ComputeContext::validateAtomOrder() {
+    if (getNonbondedUtilities().getUsesStableAtomOrder()) {
+        for (int i = 0; i < numAtoms; i++) {
+            if (atomIndex[i] != i) {
+                resetAtomOrder();
+                break;
+            }
+        }
+        return;
+    }
     for (auto& mol : moleculeGroups) {
         for (int atom : mol.atoms) {
             set<int> identical;
@@ -664,6 +700,18 @@ void ComputeContext::forceReorder() {
 
 void ComputeContext::reorderAtoms() {
     atomsWereReordered = false;
+    if (getNonbondedUtilities().getUsesStableAtomOrder()) {
+        if (numAtoms > 0 && getNonbondedUtilities().getUsePeriodic() &&
+                (stepsSinceStableRecenter >= 250 || forceNextReorder)) {
+            recenterStableAtoms();
+            stepsSinceStableRecenter = 0;
+            forceNextReorder = false;
+        }
+        else
+            stepsSinceStableRecenter++;
+        stepsSinceReorder++;
+        return;
+    }
     if (numAtoms == 0 || !getNonbondedUtilities().getUseCutoff() || (stepsSinceReorder < 250 && !forceNextReorder)) {
         stepsSinceReorder++;
         return;
@@ -677,6 +725,115 @@ void ComputeContext::reorderAtoms() {
         reorderAtomsImpl<float, mm_float4, double, mm_double4>();
     else
         reorderAtomsImpl<float, mm_float4, float, mm_float4>();
+}
+
+void ComputeContext::registerRecenterGroup(const vector<int>& atoms) {
+    if (recenterKernel)
+        throw OpenMMException("Periodic translation groups cannot change after initialization; reinitialize the Context");
+    if (recenterParents.empty()) {
+        recenterParents.resize(system.getNumParticles());
+        iota(recenterParents.begin(), recenterParents.end(), 0);
+    }
+    auto root = [&](int atom) {
+        if (atom < 0 || atom >= recenterParents.size())
+            throw OpenMMException("Invalid atom in periodic translation group");
+        while (recenterParents[atom] != atom) {
+            recenterParents[atom] = recenterParents[recenterParents[atom]];
+            atom = recenterParents[atom];
+        }
+        return atom;
+    };
+    if (!atoms.empty()) root(atoms[0]);
+    for (int i = 1; i < atoms.size(); i++) {
+        int a = root(atoms[0]), b = root(atoms[i]);
+        if (a != b)
+            recenterParents[max(a,b)] = min(a,b);
+    }
+}
+
+void ComputeContext::recenterStableAtoms() {
+    ContextSelector selector(*this);
+    if (!recenterKernel) {
+        // Constraints and virtual sites also couple coordinates, independently
+        // of which force groups happen to be evaluated on a particular step.
+        registerRecenterGroup(vector<int>());
+        for (int i = 0; i < system.getNumConstraints(); i++) {
+            int a, b; double distance;
+            system.getConstraintParameters(i, a, b, distance);
+            registerRecenterGroup({a,b});
+        }
+        for (int i = 0; i < numAtoms; i++) {
+            if (atomIndex[i] != i)
+                throw OpenMMException("Stable recentering requires original atom identity");
+            if (system.isVirtualSite(i)) {
+                const VirtualSite& site = system.getVirtualSite(i);
+                vector<int> atoms(1, i);
+                for (int j = 0; j < site.getNumParticles(); j++) atoms.push_back(site.getParticle(j));
+                registerRecenterGroup(atoms);
+            }
+        }
+        map<int, vector<int> > groups;
+        for (int i = 0; i < numAtoms; i++) {
+            int root = i;
+            while (recenterParents[root] != root) {
+                recenterParents[root] = recenterParents[recenterParents[root]];
+                root = recenterParents[root];
+            }
+            groups[root].push_back(i);
+        }
+        recenterStarts.push_back(0);
+        for (const auto& group : groups) {
+            recenterAtomList.insert(recenterAtomList.end(), group.second.begin(), group.second.end());
+            recenterStarts.push_back(recenterAtomList.size());
+        }
+        recenterAtoms.initialize<int>(*this, numAtoms, "recenterAtoms");
+        recenterRanges.initialize<int>(*this, recenterStarts.size(), "recenterRanges");
+        recenterCellShifts.initialize<mm_int4>(*this, groups.size(), "recenterCellShifts");
+        recenterAtoms.upload(recenterAtomList);
+        recenterRanges.upload(recenterStarts);
+        recenterShifts.resize(groups.size());
+        recenterKernel = compileProgram(CommonKernelSources::recenterStableAtoms)->createKernel("recenterStableAtoms");
+        recenterKernel->addArg((int) groups.size());
+        recenterKernel->addArg(recenterAtoms);
+        recenterKernel->addArg(recenterRanges);
+        recenterKernel->addArg(getPosq());
+        if (getUseMixedPrecision()) recenterKernel->addArg(getPosqCorrection());
+        recenterKernel->addArg(recenterCellShifts);
+        recenterKernel->addArg();
+        recenterKernel->addArg();
+        recenterKernel->addArg();
+    }
+    Vec3 x,y,z;
+    getPeriodicBoxVectors(x,y,z);
+    int boxArg = getUseMixedPrecision() ? 6 : 5;
+    if (getUseDoublePrecision() || getUseMixedPrecision()) {
+        recenterKernel->setArg(boxArg, mm_double4(x[0],x[1],x[2],0));
+        recenterKernel->setArg(boxArg+1, mm_double4(y[0],y[1],y[2],0));
+        recenterKernel->setArg(boxArg+2, mm_double4(z[0],z[1],z[2],0));
+    }
+    else {
+        recenterKernel->setArg(boxArg, mm_float4(x[0],x[1],x[2],0));
+        recenterKernel->setArg(boxArg+1, mm_float4(y[0],y[1],y[2],0));
+        recenterKernel->setArg(boxArg+2, mm_float4(z[0],z[1],z[2],0));
+    }
+    recenterKernel->execute(recenterShifts.size());
+    // Keep the existing host image-offset contract for getState(), checkpoints
+    // and barostat rollback. This synchronization is included in MD benchmarks.
+    recenterCellShifts.download(recenterShifts);
+    for (int group = 0; group < recenterShifts.size(); group++) {
+        const mm_int4& shift = recenterShifts[group];
+        if (shift.w != 0)
+            throw OpenMMException("Invalid particle coordinates during periodic recentering");
+        if (shift.x == 0 && shift.y == 0 && shift.z == 0) continue;
+        for (int j = recenterStarts[group]; j < recenterStarts[group+1]; j++) {
+            mm_int4& offset = posCellOffsets[recenterAtomList[j]];
+            for (long long value : {(long long) offset.x-shift.x, (long long) offset.y-shift.y, (long long) offset.z-shift.z})
+                if (value < numeric_limits<int>::min() || value > numeric_limits<int>::max())
+                    throw OpenMMException("Periodic image offset overflow during stable recentering");
+            offset.x -= shift.x; offset.y -= shift.y; offset.z -= shift.z;
+        }
+    }
+    stableRecenterCount++;
 }
 
 template <class Real, class Real4, class Mixed, class Mixed4>

@@ -1,3 +1,4 @@
+#include "openmm/common/SpatialNonbondedPolicy.h"
 /* -------------------------------------------------------------------------- *
  *                                   OpenMM                                   *
  * -------------------------------------------------------------------------- *
@@ -25,6 +26,7 @@
 #include "CudaContext.h"
 #include "CudaExpressionUtilities.h"
 #include "CudaPlatform.h"
+#include "CudaNonbondedUtilities.h"
 #include "CudaKernelFactory.h"
 #include "CudaKernels.h"
 #include "openmm/Context.h"
@@ -34,12 +36,18 @@
 #include <algorithm>
 #include <cctype>
 #include <sstream>
-#include <cstdio>
 #ifdef _MSC_VER
     #include <Windows.h>
 #endif
 using namespace OpenMM;
 using namespace std;
+
+// Internal execution settings. Context creation does not expose tuning controls.
+static const map<string, string> spatialDefaults = {
+    {"AtomReorderingForceAccumulation", "buffered"},
+    {"AtomReorderingPackedExclusions", "false"},
+    {"AtomReorderingExclusionFilter", "none"}
+};
 
 #define CHECK_RESULT(result, prefix) \
     if (result != CUDA_SUCCESS) { \
@@ -117,6 +125,7 @@ CudaPlatform::CudaPlatform() {
     platformProperties.push_back(CudaDeviceName());
     platformProperties.push_back(CudaUseBlockingSync());
     platformProperties.push_back(CudaPrecision());
+    platformProperties.push_back("AtomReorderingStatus");
     platformProperties.push_back(CudaUseCpuPme());
     platformProperties.push_back(CudaCompiler());
     platformProperties.push_back(CudaTempDirectory());
@@ -261,6 +270,8 @@ CudaPlatform::PlatformData::PlatformData(ContextImpl* context, const System& sys
             const string& cpuPmeProperty, const string& tempProperty, const string& pmeStreamProperty, const string& deterministicForcesProperty,
             int numThreads, ContextImpl* originalContext) : context(context), removeCM(false), stepCount(0), computeForceCount(0), time(0.0),
                 hasInitializedContexts(false), threads(numThreads) {
+    propertyValues[CudaPlatform::CudaAtomReordering()] = "auto";
+    propertyValues.insert(spatialDefaults.begin(), spatialDefaults.end());
     bool blocking = (blockingProperty == "true");
     vector<string> devices;
     size_t searchPos = 0, nextPos;
@@ -269,6 +280,9 @@ CudaPlatform::PlatformData::PlatformData(ContextImpl* context, const System& sys
         searchPos = nextPos+1;
     }
     devices.push_back(deviceIndexProperty.substr(searchPos));
+    int selectedDevices = 0;
+    for (const auto& device : devices) if (!device.empty()) selectedDevices++;
+    SpatialNonbondedPolicy::configure(propertyValues, system, max(1, selectedDevices), true, context == nullptr ? nullptr : &context->getIntegrator());
     PlatformData* originalData = NULL;
     if (originalContext != NULL)
         originalData = reinterpret_cast<PlatformData*>(originalContext->getPlatformData());

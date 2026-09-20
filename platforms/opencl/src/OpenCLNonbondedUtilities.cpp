@@ -24,6 +24,7 @@
 
 #include "openmm/OpenMMException.h"
 #include "OpenCLNonbondedUtilities.h"
+#include "OpenCLSpatialNonbonded.h"
 #include "OpenCLArray.h"
 #include "OpenCLContext.h"
 #include "OpenCLKernelSources.h"
@@ -94,7 +95,7 @@ OpenCLNonbondedUtilities::~OpenCLNonbondedUtilities() {
 }
 
 void OpenCLNonbondedUtilities::addInteraction(bool usesCutoff, bool usesPeriodic, bool usesExclusions, double cutoffDistance,
-            const vector<vector<int> >& exclusionList, const string& kernel, int forceGroup, bool useNeighborList, bool supportsPairList) {
+            const vector<vector<int> >& exclusionList, const string& kernel, int forceGroup, bool useNeighborList, bool supportsPairList, bool supportsExclusionOmission) {
     if (groupCutoff.size() > 0) {
         if (usesCutoff != useCutoff)
             throw OpenMMException("All Forces must agree on whether to use a cutoff");
@@ -108,6 +109,7 @@ void OpenCLNonbondedUtilities::addInteraction(bool usesCutoff, bool usesPeriodic
     useCutoff = usesCutoff;
     usePeriodic = usesPeriodic;
     this->useNeighborList |= ((useNeighborList || deviceIsCpu) && useCutoff);
+    canOmitExcludedPairs &= supportsExclusionOmission;
     groupCutoff[forceGroup] = cutoffDistance;
     groupFlags |= 1<<forceGroup;
     if (kernel.size() > 0) {
@@ -263,7 +265,7 @@ void OpenCLNonbondedUtilities::initialize(const System& system) {
             }
         }
     }
-    atomExclusions.clear(); // We won't use this again, so free the memory it used
+    // Retain original exclusions until the optional spatial view is initialized.
     exclusions.upload(exclusionVec);
 
     // Create data structures for the neighbor list.
@@ -299,7 +301,40 @@ void OpenCLNonbondedUtilities::initialize(const System& system) {
         interactionCount.upload(count);
         rebuildNeighborList.upload(count);
     }
+    if (spatial) spatial->initialize(system);
+    atomExclusions.clear();
 }
+
+void OpenCLNonbondedUtilities::configureSpatial() {
+    if (context.getPlatformData().propertyValues.at("AtomReordering") != "baseline")
+        spatial.reset(new OpenCLSpatialNonbonded(context, *this));
+}
+
+bool OpenCLNonbondedUtilities::finishSpatialForces() {
+    spatialViewReady = false;
+    return spatial && spatial->mergeForces();
+}
+
+ArrayInterface* OpenCLNonbondedUtilities::getInverseSpatialAtomOrder() {
+    return spatial && spatial->getReorderCount() > 0 ? &spatial->getInverseAtomOrder() : nullptr;
+}
+
+ArrayInterface* OpenCLNonbondedUtilities::getReorderedParameterArray(ArrayInterface& original) {
+    if (!spatial || spatial->getReorderCount() == 0)
+        return nullptr;
+    if (!original.isInitialized() || &original.getContext() != &context)
+        throw OpenMMException("Spatial parameter source must belong to this ComputeContext");
+    for (const auto& entry : context.getReorderedArraySet().getEntries())
+        if (&context.unwrap(original) == entry.original)
+            return entry.sorted;
+    return nullptr;
+}
+
+void OpenCLNonbondedUtilities::invalidateSpatialParameters() {
+    if (spatial) spatial->invalidateParameters();
+}
+
+
 
 static void setPeriodicBoxArgs(OpenCLContext& cl, cl::Kernel& kernel, int index) {
     if (cl.getUseDoublePrecision()) {
@@ -331,8 +366,10 @@ double OpenCLNonbondedUtilities::padCutoff(double cutoff) {
 }
 
 void OpenCLNonbondedUtilities::prepareInteractions(int forceGroups) {
+    spatialViewReady = false;
     if ((forceGroups&groupFlags) == 0)
         return;
+    if (spatial) { spatial->prepare(); spatialViewReady = true; }
     if (groupKernels.find(forceGroups) == groupKernels.end())
         createKernelsForGroups(forceGroups);
     KernelSet& kernels = groupKernels[forceGroups];
@@ -350,13 +387,15 @@ void OpenCLNonbondedUtilities::prepareInteractions(int forceGroups) {
     // Compute the neighbor list.
 
     setPeriodicBoxArgs(context, kernels.findBlockBoundsKernel, 1);
-    context.executeKernel(kernels.findBlockBoundsKernel, context.getNumAtomBlocks());
-    context.executeKernel(kernels.computeSortKeysKernel, context.getNumAtomBlocks());
+    bool packed = spatial && spatial->usesPackedExclusions();
+    if (packed) kernels.findBlockBoundsKernel.setArg<cl_int>(18, forceRebuildNeighborList);
+    context.executeKernel(kernels.findBlockBoundsKernel, context.getNumAtomBlocks()*(packed ? 8 : 1));
+    if (!packed) context.executeKernel(kernels.computeSortKeysKernel, context.getNumAtomBlocks());
     if (useLargeBlocks)
         setPeriodicBoxArgs(context, kernels.sortBoxDataKernel, 12);
-    blockSorter->sort(sortedBlocks);
+    if (!packed) blockSorter->sort(sortedBlocks);
     kernels.sortBoxDataKernel.setArg<cl_int>(9, forceRebuildNeighborList);
-    context.executeKernel(kernels.sortBoxDataKernel, context.getNumAtoms());
+    if (!packed || useLargeBlocks) context.executeKernel(kernels.sortBoxDataKernel, context.getNumAtoms());
     setPeriodicBoxArgs(context, kernels.findInteractingBlocksKernel, 0);
     context.executeKernel(kernels.findInteractingBlocksKernel, context.getNumAtoms(), interactingBlocksThreadBlockSize);
     forceRebuildNeighborList = false;
@@ -381,6 +420,7 @@ void OpenCLNonbondedUtilities::computeInteractions(int forceGroups, bool include
         cl::Kernel& kernel = (includeForces ? (includeEnergy ? kernels.forceEnergyKernel : kernels.forceKernel) : kernels.energyKernel);
         if (*reinterpret_cast<cl_kernel*>(&kernel) == NULL)
             kernel = createInteractionKernel(kernels.source, parameters, arguments, true, true, forceGroups, includeForces, includeEnergy);
+        if (spatial) spatial->gatherParameters(includeForces);
         if (useCutoff)
             setPeriodicBoxArgs(context, kernel, 9);
         context.executeKernel(kernel, numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
@@ -401,7 +441,7 @@ bool OpenCLNonbondedUtilities::updateNeighborListSize() {
         return false;
     if (context.getStepsSinceReorder() == 0 || tilesAfterReorder == 0)
         tilesAfterReorder = pinnedCountMemory[0];
-    else if (context.getStepsSinceReorder() > 25 && pinnedCountMemory[0] > 1.1*tilesAfterReorder)
+    else if (!spatial && context.getStepsSinceReorder() > 25 && pinnedCountMemory[0] > 1.1*tilesAfterReorder)
         context.forceReorder();
     if (pinnedCountMemory[0] <= interactingTiles.getSize())
         return false;
@@ -416,6 +456,7 @@ bool OpenCLNonbondedUtilities::updateNeighborListSize() {
         maxTiles = totalTiles;
     interactingTiles.resize(maxTiles);
     interactingAtoms.resize(OpenCLContext::TileSize*(size_t) maxTiles);
+    if (spatial) spatial->resizeNeighborMasks();
     for (map<int, KernelSet>::iterator iter = groupKernels.begin(); iter != groupKernels.end(); ++iter) {
         KernelSet& kernels = iter->second;
         if (*reinterpret_cast<cl_kernel*>(&kernels.forceKernel) != NULL) {
@@ -436,6 +477,12 @@ bool OpenCLNonbondedUtilities::updateNeighborListSize() {
         kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(6, interactingTiles.getDeviceBuffer());
         kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(7, interactingAtoms.getDeviceBuffer());
         kernels.findInteractingBlocksKernel.setArg<cl_uint>(9, maxTiles);
+        if (spatial && spatial->usesPackedExclusions()) {
+            kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(19, spatial->neighborMasks.getDeviceBuffer());
+            for (cl::Kernel* force : {&kernels.forceKernel, &kernels.energyKernel, &kernels.forceEnergyKernel})
+                if (*reinterpret_cast<cl_kernel*>(force) != NULL)
+                    force->setArg<cl::Buffer>(force->getInfo<CL_KERNEL_NUM_ARGS>()-1, spatial->neighborMasks.getDeviceBuffer());
+        }
     }
     forceRebuildNeighborList = true;
     context.setForcesValid(false);
@@ -505,6 +552,9 @@ void OpenCLNonbondedUtilities::createKernelsForGroups(int groups) {
         if (useLargeBlocks)
             defines["USE_LARGE_BLOCKS"] = "1";
         defines["MAX_EXCLUSIONS"] = context.intToString(maxExclusions);
+        if (spatial) defines["SPATIAL_ATOM_ORDER"] = "1";
+        if (spatial && spatial->usesPackedExclusions()) defines["PACKED_EXCLUSIONS"] = "1";
+        if (spatial && spatial->usesBoundsGather()) defines["SPATIAL_GATHER_BOUNDS"] = "1";
         defines["BUFFER_GROUPS"] = (deviceIsCpu ? "4" : "2");
         int binShift = 1;
         while (1<<binShift <= context.getNumAtomBlocks())
@@ -518,11 +568,23 @@ void OpenCLNonbondedUtilities::createKernelsForGroups(int groups) {
             cl::Program interactingBlocksProgram = context.createProgram(file, defines);
             kernels.findBlockBoundsKernel = cl::Kernel(interactingBlocksProgram, "findBlockBounds");
             kernels.findBlockBoundsKernel.setArg<cl_int>(0, context.getNumAtoms());
-            kernels.findBlockBoundsKernel.setArg<cl::Buffer>(6, context.unwrap(context.getPosq()).getDeviceBuffer());
+            kernels.findBlockBoundsKernel.setArg<cl::Buffer>(6, (spatial ? spatial->getPositions() : context.unwrap(context.getPosq())).getDeviceBuffer());
             kernels.findBlockBoundsKernel.setArg<cl::Buffer>(7, blockCenter.getDeviceBuffer());
             kernels.findBlockBoundsKernel.setArg<cl::Buffer>(8, blockBoundingBox.getDeviceBuffer());
             kernels.findBlockBoundsKernel.setArg<cl::Buffer>(9, rebuildNeighborList.getDeviceBuffer());
             kernels.findBlockBoundsKernel.setArg<cl::Buffer>(10, blockSizeRange.getDeviceBuffer());
+            if (spatial && spatial->usesBoundsGather()) {
+                kernels.findBlockBoundsKernel.setArg<cl::Buffer>(11, context.unwrap(context.getPosq()).getDeviceBuffer());
+                kernels.findBlockBoundsKernel.setArg<cl::Buffer>(12, spatial->getAtomOrder().getDeviceBuffer());
+                kernels.findBlockBoundsKernel.setArg<cl::Buffer>(13, spatial->forces.getDeviceBuffer());
+            }
+            if (spatial && spatial->usesPackedExclusions()) {
+                kernels.findBlockBoundsKernel.setArg<cl::Buffer>(14, sortedBlockCenter.getDeviceBuffer());
+                kernels.findBlockBoundsKernel.setArg<cl::Buffer>(15, sortedBlockBoundingBox.getDeviceBuffer());
+                kernels.findBlockBoundsKernel.setArg<cl::Buffer>(16, oldPositions.getDeviceBuffer());
+                kernels.findBlockBoundsKernel.setArg<cl::Buffer>(17, interactionCount.getDeviceBuffer());
+                kernels.findBlockBoundsKernel.setArg<cl_int>(18, true);
+            }
             kernels.computeSortKeysKernel = cl::Kernel(interactingBlocksProgram, "computeSortKeys");
             kernels.computeSortKeysKernel.setArg<cl::Buffer>(0, blockBoundingBox.getDeviceBuffer());
             kernels.computeSortKeysKernel.setArg<cl::Buffer>(1, sortedBlocks.getDeviceBuffer());
@@ -534,7 +596,7 @@ void OpenCLNonbondedUtilities::createKernelsForGroups(int groups) {
             kernels.sortBoxDataKernel.setArg<cl::Buffer>(2, blockBoundingBox.getDeviceBuffer());
             kernels.sortBoxDataKernel.setArg<cl::Buffer>(3, sortedBlockCenter.getDeviceBuffer());
             kernels.sortBoxDataKernel.setArg<cl::Buffer>(4, sortedBlockBoundingBox.getDeviceBuffer());
-            kernels.sortBoxDataKernel.setArg<cl::Buffer>(5, context.unwrap(context.getPosq()).getDeviceBuffer());
+            kernels.sortBoxDataKernel.setArg<cl::Buffer>(5, (spatial ? spatial->getPositions() : context.unwrap(context.getPosq())).getDeviceBuffer());
             kernels.sortBoxDataKernel.setArg<cl::Buffer>(6, oldPositions.getDeviceBuffer());
             kernels.sortBoxDataKernel.setArg<cl::Buffer>(7, interactionCount.getDeviceBuffer());
             kernels.sortBoxDataKernel.setArg<cl::Buffer>(8, rebuildNeighborList.getDeviceBuffer());
@@ -547,7 +609,7 @@ void OpenCLNonbondedUtilities::createKernelsForGroups(int groups) {
             kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(5, interactionCount.getDeviceBuffer());
             kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(6, interactingTiles.getDeviceBuffer());
             kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(7, interactingAtoms.getDeviceBuffer());
-            kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(8, context.unwrap(context.getPosq()).getDeviceBuffer());
+            kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(8, (spatial ? spatial->getPositions() : context.unwrap(context.getPosq())).getDeviceBuffer());
             kernels.findInteractingBlocksKernel.setArg<cl_uint>(9, interactingTiles.getSize());
             kernels.findInteractingBlocksKernel.setArg<cl_uint>(10, startBlockIndex);
             kernels.findInteractingBlocksKernel.setArg<cl_uint>(11, numBlocks);
@@ -558,9 +620,16 @@ void OpenCLNonbondedUtilities::createKernelsForGroups(int groups) {
             kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(16, exclusionRowIndices.getDeviceBuffer());
             kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(17, oldPositions.getDeviceBuffer());
             kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(18, rebuildNeighborList.getDeviceBuffer());
+            int extra = 19;
+            if (spatial && spatial->usesPackedExclusions()) {
+                kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(extra++, spatial->neighborMasks.getDeviceBuffer());
+                kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(extra++, spatial->blockRows.getDeviceBuffer());
+                kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(extra++, spatial->blockTable.getDeviceBuffer());
+                kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(extra++, spatial->blockFilters.getDeviceBuffer());
+            }
             if (useLargeBlocks) {
-                kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(19, largeBlockCenter.getDeviceBuffer());
-                kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(20, largeBlockBoundingBox.getDeviceBuffer());
+                kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(extra++, largeBlockCenter.getDeviceBuffer());
+                kernels.findInteractingBlocksKernel.setArg<cl::Buffer>(extra++, largeBlockBoundingBox.getDeviceBuffer());
             }
             if (kernels.findInteractingBlocksKernel.getWorkGroupInfo<CL_KERNEL_WORK_GROUP_SIZE>(context.getDevice()) < groupSize) {
                 // The device can't handle this block size, so reduce it.
@@ -579,7 +648,6 @@ void OpenCLNonbondedUtilities::createKernelsForGroups(int groups) {
 
 cl::Kernel OpenCLNonbondedUtilities::createInteractionKernel(const string& source, vector<ComputeParameterInfo>& params, vector<ComputeParameterInfo>& arguments, bool useExclusions, bool isSymmetric, int groups, bool includeForces, bool includeEnergy) {
     map<string, string> replacements;
-    replacements["COMPUTE_INTERACTION"] = source;
     const string suffixes[] = {"x", "y", "z", "w"};
     stringstream localData;
     int localDataSize = 0;
@@ -625,6 +693,8 @@ cl::Kernel OpenCLNonbondedUtilities::createInteractionKernel(const string& sourc
     }
     if (energyParameterDerivatives.size() > 0)
         args << ", __global mixed* restrict energyParamDerivs";
+    if (spatial) args << ", __global const int* restrict spatialExclusionCount";
+    if (spatial && spatial->usesPackedExclusions()) args << ", __global const unsigned int* restrict neighborMasks";
     replacements["PARAMETER_ARGUMENTS"] = args.str();
     stringstream loadLocal1;
     for (const ComputeParameterInfo& param : params) {
@@ -706,6 +776,10 @@ cl::Kernel OpenCLNonbondedUtilities::createInteractionKernel(const string& sourc
         defines["USE_PERIODIC"] = "1";
     if (useExclusions)
         defines["USE_EXCLUSIONS"] = "1";
+    replacements["COMPUTE_INTERACTION"] = source;
+    replacements["COMPUTE_EXCLUSION_INTERACTION"] = source;
+    replacements["COMPUTE_PAIR_INTERACTION"] = source;
+
     if (isSymmetric)
         defines["USE_SYMMETRIC"] = "1";
     if (useNeighborList)
@@ -739,17 +813,63 @@ cl::Kernel OpenCLNonbondedUtilities::createInteractionKernel(const string& sourc
     int endExclusionIndex = (context.getContextIndex()+1)*numExclusionTiles/numContexts;
     defines["FIRST_EXCLUSION_TILE"] = context.intToString(startExclusionIndex);
     defines["LAST_EXCLUSION_TILE"] = context.intToString(endExclusionIndex);
+    if (spatial) {
+        if (&params != &parameters)
+            throw OpenMMException("Independent nonbonded kernels must explicitly support spatial atom ordering");
+        defines["SPATIAL_ATOM_ORDER"] = "1";
+        defines["NUM_TILES_WITH_EXCLUSIONS"] = "spatialExclusionCount[0]";
+        defines["FIRST_EXCLUSION_TILE"] = "0";
+        defines["LAST_EXCLUSION_TILE"] = "spatialExclusionCount[0]";
+        if (spatial->usesIdentityOrdering()) {
+            defines["NUM_TILES_WITH_EXCLUSIONS"] = context.intToString(numExclusionTiles);
+            defines["LAST_EXCLUSION_TILE"] = context.intToString(numExclusionTiles);
+        }
+    }
     if ((localDataSize/4)%2 == 0)
         defines["PARAMETER_SIZE_IS_EVEN"] = "1";
-    cl::Program program = context.createProgram(context.replaceStrings(kernelSource, replacements), defines);
+    if (spatial && spatial->usesPackedExclusions()) {
+        defines["PACKED_EXCLUSIONS"] = "1";
+        defines["DIAGONAL_EXCLUSION_TILES"] = "1";
+        if (context.getUseDoublePrecision()) defines["GUARD_NONBONDED_ARITHMETIC"] = "1";
+        defines["NUM_TILES_WITH_EXCLUSIONS"] = context.intToString(context.getNumAtomBlocks());
+        defines["LAST_EXCLUSION_TILE"] = context.intToString(context.getNumAtomBlocks());
+    }
+    string executionSource = kernelSource;
+    if (spatial && spatial->usesPackedExclusions()) {
+        // Specialize clean tiles without duplicating the maintained kernel body.
+        const string begin = "// BEGIN_SPATIAL_TILE", end = "// END_SPATIAL_TILE";
+        size_t first = executionSource.find(begin), last = executionSource.find(end);
+        if (first == string::npos || last == string::npos)
+            throw OpenMMException("Packed exclusions require the spatial tile template");
+        string masked = executionSource.substr(first+begin.size(), last-first-begin.size());
+        // Keep per-tile fixed-point conversion, but combine same-row atomic writes.
+        for (const string& axis : {"x", "y", "z"}) {
+            string offset = (axis == "x" ? "" : axis == "y" ? "+PADDED_NUM_ATOMS" : "+2*PADDED_NUM_ATOMS");
+            string before = "ATOMIC_ADD(&forceBuffers[atom1"+offset+"], (mm_ulong) realToFixedPoint(force."+axis+"));";
+            string after = "rowForce"+axis+" += (mm_ulong) realToFixedPoint(force."+axis+");";
+            size_t at = masked.find(before);
+            if (at == string::npos) throw OpenMMException("Missing spatial row force write");
+            masked.replace(at, before.size(), after);
+        }
+        string body = "#ifdef INCLUDE_FORCES\nmm_ulong rowForcex=0, rowForcey=0, rowForcez=0;\n#endif\ndo {\nforce = (real4) 0;\n"
+                "if (((unsigned int) tiles[pos]&0x80000000u) != 0) {\nconst bool hasExclusions = false;\n#undef PACKED_EXCLUSIONS\n"+
+                masked+"\n#define PACKED_EXCLUSIONS 1\n} else {\n"+masked+"\n}\npos++;\n"
+                "} while (pos < end && (tiles[pos]&0x7fffffff) == x);\n"
+                "#ifdef INCLUDE_FORCES\nunsigned int rowAtom = x*TILE_SIZE+tgx;\n"
+                "ATOMIC_ADD(&forceBuffers[rowAtom], rowForcex);\n"
+                "ATOMIC_ADD(&forceBuffers[rowAtom+PADDED_NUM_ATOMS], rowForcey);\n"
+                "ATOMIC_ADD(&forceBuffers[rowAtom+2*PADDED_NUM_ATOMS], rowForcez);\n#endif\n";
+        executionSource.replace(first, last+end.size()-first, body);
+    }
+    cl::Program program = context.createProgram(context.replaceStrings(executionSource, replacements), defines);
     cl::Kernel kernel(program, "computeNonbonded");
 
     // Set arguments to the Kernel.
 
     int index = 0;
-    kernel.setArg<cl::Memory>(index++, context.unwrap(context.getLongForceBuffer()).getDeviceBuffer());
+    kernel.setArg<cl::Memory>(index++, (spatial ? spatial->getForces() : context.unwrap(context.getLongForceBuffer())).getDeviceBuffer());
     kernel.setArg<cl::Buffer>(index++, context.unwrap(context.getEnergyBuffer()).getDeviceBuffer());
-    kernel.setArg<cl::Buffer>(index++, context.unwrap(context.getPosq()).getDeviceBuffer());
+    kernel.setArg<cl::Buffer>(index++, (spatial ? spatial->getPositions() : context.unwrap(context.getPosq())).getDeviceBuffer());
     kernel.setArg<cl::Buffer>(index++, exclusions.getDeviceBuffer());
     kernel.setArg<cl::Buffer>(index++, exclusionTiles.getDeviceBuffer());
     kernel.setArg<cl_uint>(index++, startTileIndex);
@@ -763,15 +883,34 @@ cl::Kernel OpenCLNonbondedUtilities::createInteractionKernel(const string& sourc
         kernel.setArg<cl::Buffer>(index++, blockBoundingBox.getDeviceBuffer());
         kernel.setArg<cl::Buffer>(index++, interactingAtoms.getDeviceBuffer());
     }
-    for (ComputeParameterInfo& param : params)
-        kernel.setArg<cl::Memory>(index++, context.unwrap(param.getArray()).getDeviceBuffer());
+    for (int i = 0; i < params.size(); i++)
+        kernel.setArg<cl::Memory>(index++, (spatial ? *spatial->parameters[i] : context.unwrap(params[i].getArray())).getDeviceBuffer());
     for (ComputeParameterInfo& arg : arguments)
         kernel.setArg<cl::Memory>(index++, context.unwrap(arg.getArray()).getDeviceBuffer());
     if (energyParameterDerivatives.size() > 0)
         kernel.setArg<cl::Memory>(index++, context.unwrap(context.getEnergyParamDerivBuffer()).getDeviceBuffer());
+    if (spatial) kernel.setArg<cl::Buffer>(index++, spatial->exclusionCount.getDeviceBuffer());
+    if (spatial && spatial->usesPackedExclusions()) kernel.setArg<cl::Buffer>(index++, spatial->neighborMasks.getDeviceBuffer());
     return kernel;
 }
 
 void OpenCLNonbondedUtilities::setKernelSource(const string& source) {
     kernelSource = source;
+}
+
+SpatialNonbondedView OpenCLNonbondedUtilities::getSpatialWorkView(bool includeForces) {
+    if (!spatial || !spatialViewReady)
+        throw OpenMMException("Spatial work is only available during an active nonbonded evaluation");
+
+    if (spatial->usesPackedExclusions())
+        throw OpenMMException("Spatial work view requires full exclusion tiles");
+    spatial->gatherParameters(includeForces);
+    return {&spatial->getPositions(), &spatial->getForces(),
+        &spatial->getAtomOrder(), &spatial->getInverseAtomOrder(),
+        &exclusionTiles, &exclusions, &spatial->exclusionCount,
+        &exclusionRowIndices, &exclusionIndices,
+        useNeighborList ? &interactingTiles : nullptr,
+        useNeighborList ? &interactingAtoms : nullptr,
+        useNeighborList ? &interactionCount : nullptr, nullptr,
+        context.getNumAtoms(), context.getPaddedNumAtoms(), spatial->getReorderCount(), useNeighborList};
 }

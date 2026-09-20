@@ -18,3 +18,8 @@ ADD_CUSTOM_TARGET(CommonKernels DEPENDS ${KERNELS_CPP} ${KERNELS_H})
 
 FILE(GLOB CORE_HEADERS include/openmm/common/*.h ${KERNELS_H})
 INSTALL_FILES(/include/openmm/common FILES ${CORE_HEADERS})
+
+IF(BUILD_TESTING)
+    ADD_EXECUTABLE(TestSpatialExclusionFilter tests/TestSpatialExclusionFilter.cpp)
+    ADD_TEST(NAME TestSpatialExclusionFilter COMMAND TestSpatialExclusionFilter)
+ENDIF()

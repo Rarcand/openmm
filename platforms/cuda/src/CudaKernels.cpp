@@ -79,6 +79,7 @@ double CudaCalcForcesAndEnergyKernel::finishComputation(ContextImpl& context, bo
     ContextSelector selector(cu);
     cu.getBondedUtilities().computeInteractions(groups);
     cu.getNonbondedUtilities().computeInteractions(groups, includeForces, includeEnergy);
+    cu.getNonbondedUtilities().finishSpatialForces();
     double sum = 0.0;
     for (auto computation : cu.getPostComputations())
         sum += computation->computeForceAndEnergy(includeForces, includeEnergy, groups);

@@ -85,7 +85,7 @@ public:
      */
     void addInteraction(bool usesCutoff, bool usesPeriodic, bool usesExclusions, double cutoffDistance,
                         const std::vector<std::vector<int> >& exclusionList, const std::string& kernel,
-                        int forceGroup, bool useNeighborList=true, bool supportsPairList=false);
+                        int forceGroup, bool useNeighborList=true, bool supportsPairList=false, bool supportsExclusionOmission=false);
     /**
      * Add a per-atom parameter that the default interaction kernel may depend on.
      */

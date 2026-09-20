@@ -30,7 +30,13 @@ __kernel void computeNonbonded(
     for (int pos = firstExclusionTile; pos < lastExclusionTile; pos++) {
         const int2 tileIndices = exclusionTiles[pos];
         const unsigned int x = tileIndices.x;
+#ifdef DIAGONAL_EXCLUSION_TILES
+        // The representation guarantees x == y for every entry. Exposing that
+        // invariant lets the compiler remove all off-diagonal code and state.
+        const unsigned int y = x;
+#else
         const unsigned int y = tileIndices.y;
+#endif
 
         // Load the data for this tile.
 

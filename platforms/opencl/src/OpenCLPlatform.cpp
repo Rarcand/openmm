@@ -1,3 +1,4 @@
+#include "openmm/common/SpatialNonbondedPolicy.h"
 /* -------------------------------------------------------------------------- *
  *                                   OpenMM                                   *
  * -------------------------------------------------------------------------- *
@@ -23,6 +24,7 @@
  * -------------------------------------------------------------------------- */
 
 #include "OpenCLContext.h"
+#include "OpenCLNonbondedUtilities.h"
 #include "OpenCLPlatform.h"
 #include "OpenCLKernelFactory.h"
 #include "OpenCLKernels.h"
@@ -52,6 +54,12 @@ extern "C" OPENMM_EXPORT_COMMON void registerPlatforms() {
         Platform::registerPlatform(new OpenCLPlatform());
 }
 #endif
+
+namespace {
+const map<string, string> spatialDefaults = {
+    {"AtomReordering", "auto"}
+};
+}
 
 OpenCLPlatform::OpenCLPlatform() {
     deprecatedPropertyReplacements["OpenCLDeviceIndex"] = OpenCLDeviceIndex();
@@ -109,6 +117,7 @@ OpenCLPlatform::OpenCLPlatform() {
     platformProperties.push_back(OpenCLPlatformIndex());
     platformProperties.push_back(OpenCLPlatformName());
     platformProperties.push_back(OpenCLPrecision());
+    platformProperties.push_back("AtomReorderingStatus");
     platformProperties.push_back(OpenCLUseCpuPme());
     platformProperties.push_back(OpenCLDisablePmeStream());
     setPropertyDefaultValue(OpenCLDeviceIndex(), "");
@@ -166,7 +175,8 @@ bool OpenCLPlatform::isPlatformSupported() {
 
 const string& OpenCLPlatform::getPropertyValue(const Context& context, const string& property) const {
     const ContextImpl& impl = getContextImpl(context);
-    const PlatformData* data = reinterpret_cast<const PlatformData*>(impl.getPlatformData());
+    PlatformData* data = const_cast<PlatformData*>(reinterpret_cast<const PlatformData*>(impl.getPlatformData()));
+
     string propertyName = property;
     if (deprecatedPropertyReplacements.find(property) != deprecatedPropertyReplacements.end())
         propertyName = deprecatedPropertyReplacements.find(property)->second;
@@ -263,6 +273,14 @@ void OpenCLPlatform::contextCreated(ContextImpl& context, const map<string, stri
         stringstream(threadsEnv) >> threads;
     context.setPlatformData(new PlatformData(context.getSystem(), &context, platformPropValue, devicePropValue, precisionPropValue, cpuPmePropValue,
             pmeStreamPropValue, threads, NULL));
+    PlatformData* data = reinterpret_cast<PlatformData*>(context.getPlatformData());
+    for (const auto& option : spatialDefaults)
+        data->propertyValues[option.first] = option.second;
+    bool supportedLayout = true;
+    for (auto cc : data->contexts)
+        supportedLayout = supportedLayout && cc->getSIMDWidth() == 32 && cc->getDevice().getInfo<CL_DEVICE_TYPE>() != CL_DEVICE_TYPE_CPU;
+    SpatialNonbondedPolicy::configure(data->propertyValues, context.getSystem(), data->contexts.size(), supportedLayout, &context.getIntegrator());
+    for (auto cc : data->contexts) cc->getNonbondedUtilities().configureSpatial();
 }
 
 void OpenCLPlatform::linkedContextCreated(ContextImpl& context, ContextImpl& originalContext) const {
@@ -275,6 +293,14 @@ void OpenCLPlatform::linkedContextCreated(ContextImpl& context, ContextImpl& ori
     int threads = reinterpret_cast<PlatformData*>(originalContext.getPlatformData())->threads.getNumThreads();
     context.setPlatformData(new PlatformData(context.getSystem(), &context, platformPropValue, devicePropValue, precisionPropValue, cpuPmePropValue,
             pmeStreamPropValue, threads, &originalContext));
+    PlatformData* data = reinterpret_cast<PlatformData*>(context.getPlatformData());
+    for (const auto& option : spatialDefaults)
+        data->propertyValues[option.first] = platform.getPropertyValue(originalContext.getOwner(), option.first);
+    bool supportedLayout = true;
+    for (auto cc : data->contexts)
+        supportedLayout = supportedLayout && cc->getSIMDWidth() == 32 && cc->getDevice().getInfo<CL_DEVICE_TYPE>() != CL_DEVICE_TYPE_CPU;
+    SpatialNonbondedPolicy::configure(data->propertyValues, context.getSystem(), data->contexts.size(), supportedLayout, &context.getIntegrator());
+    for (auto cc : data->contexts) cc->getNonbondedUtilities().configureSpatial();
 }
 
 void OpenCLPlatform::contextDestroyed(ContextImpl& context) const {
@@ -311,7 +337,7 @@ OpenCLPlatform::PlatformData::PlatformData(const System& system, ContextImpl* co
     }
     catch (...) {
         // If an exception was thrown, do our best to clean up memory.
-        
+
         for (int i = 0; i < (int) contexts.size(); i++)
             delete contexts[i];
         throw;

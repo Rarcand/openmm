@@ -38,6 +38,7 @@
 namespace OpenMM {
     
 class CudaContext;
+class CudaSpatialNonbonded;
 
 /**
  * This class provides a generic interface for calculating nonbonded interactions.  It does this in two
@@ -68,6 +69,12 @@ class OPENMM_EXPORT_COMMON CudaNonbondedUtilities : public NonbondedUtilities  {
 public:
     CudaNonbondedUtilities(CudaContext& context);
     ~CudaNonbondedUtilities();
+    void finishSpatialForces();
+    void invalidateSpatialParameters();
+    ArrayInterface* getInverseSpatialAtomOrder() override;
+    ArrayInterface* getReorderedParameterArray(ArrayInterface& original) override;
+    SpatialNonbondedView getSpatialWorkView(bool includeForces) override;
+    bool getUsesStableAtomOrder() const { return spatial.get() != NULL; }
     /**
      * Add a nonbonded interaction to be evaluated by the default interaction kernel.
      *
@@ -80,11 +87,13 @@ public:
      * @param forceGroup       the force group in which the interaction should be calculated
      * @param useNeighborList  specifies whether a neighbor list should be used to optimize this interaction.  This should
      *                         be viewed as only a suggestion.  Even when it is false, a neighbor list may be used anyway.
+     * @param supportsExclusionOmission true only if excluded pairs require no calculation in this kernel.
+     *        Every consumer must opt in before a backend may omit them during neighbor construction.
      * @param supportsPairList specifies whether this interaction can work with a neighbor list that uses a separate pair list
      */
     void addInteraction(bool usesCutoff, bool usesPeriodic, bool usesExclusions, double cutoffDistance,
                         const std::vector<std::vector<int> >& exclusionList, const std::string& kernel,
-                        int forceGroup, bool useNeighborList=true, bool supportsPairList=false);
+                        int forceGroup, bool useNeighborList=true, bool supportsPairList=false, bool supportsExclusionOmission=false);
     /**
      * Add a per-atom parameter that the default interaction kernel may depend on.
      */
@@ -293,6 +302,9 @@ public:
      */
     void setKernelSource(const std::string& source);
 private:
+    friend class CudaSpatialNonbonded;
+    std::unique_ptr<CudaSpatialNonbonded> spatial;
+
     class KernelSet;
     class BlockSortTrait;
     void initParamArgs();
@@ -320,6 +332,9 @@ private:
     ComputeSort blockSorter;
     CUevent downloadCountEvent;
     unsigned int* pinnedCountBuffer;
+    bool spatialViewReady = false;
+    bool canUseIndexedPositions = false;
+
     std::vector<void*> forceArgs, findBlockBoundsArgs, computeSortKeysArgs, sortBoxDataArgs, findInteractingBlocksArgs;
     std::vector<std::vector<int> > atomExclusions;
     std::vector<ComputeParameterInfo> parameters;
@@ -328,7 +343,7 @@ private:
     std::map<int, double> groupCutoff;
     std::map<int, std::string> groupKernelSource;
     double maxCutoff;
-    bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, canUsePairList, useLargeBlocks, hasInitializedParams;
+    bool useCutoff, usePeriodic, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, canUsePairList, canOmitExcludedPairs, useLargeBlocks, hasInitializedParams;
     int startTileIndex, startBlockIndex, numBlocks, maxExclusions, numForceThreadBlocks, forceThreadBlockSize, numAtoms, groupFlags, numBlockSizes, paramStartIndex;
     unsigned int maxTiles, maxSinglePairs, tilesAfterReorder;
     long long numTiles;

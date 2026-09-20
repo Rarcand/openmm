@@ -30,6 +30,7 @@
 #include "OpenCLExpressionUtilities.h"
 #include "openmm/common/ComputeSort.h"
 #include "openmm/common/NonbondedUtilities.h"
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -63,10 +64,23 @@ class OpenCLContext;
  * by ForceImpls during calcForcesAndEnergy().
  */
 
+class OpenCLSpatialNonbonded;
+
 class OPENMM_EXPORT_COMMON OpenCLNonbondedUtilities : public NonbondedUtilities {
 public:
     OpenCLNonbondedUtilities(OpenCLContext& context);
     ~OpenCLNonbondedUtilities();
+    void configureSpatial();
+    bool finishSpatialForces();
+    void invalidateSpatialParameters() override;
+    ArrayInterface* getInverseSpatialAtomOrder() override;
+    ArrayInterface* getReorderedParameterArray(ArrayInterface& original) override;
+    SpatialNonbondedView getSpatialWorkView(bool includeForces) override;
+    bool getUsesStableAtomOrder() const override { return spatial != nullptr; }
+private:
+    friend class OpenCLSpatialNonbonded;
+    std::unique_ptr<OpenCLSpatialNonbonded> spatial;
+public:
     /**
      * Add a nonbonded interaction to be evaluated by the default interaction kernel.
      *
@@ -79,11 +93,13 @@ public:
      * @param forceGroup     the force group in which the interaction should be calculated
      * @param useNeighborList  specifies whether a neighbor list should be used to optimize this interaction.  This should
      *                         be viewed as only a suggestion.  Even when it is false, a neighbor list may be used anyway.
+     * @param supportsExclusionOmission true only if excluded pairs require no calculation in this kernel.
+     *        Every consumer must opt in before a backend may omit them during neighbor construction.
      * @param supportsPairList specifies whether this interaction can work with a neighbor list that uses a separate pair list
      */
     void addInteraction(bool usesCutoff, bool usesPeriodic, bool usesExclusions, double cutoffDistance,
                         const std::vector<std::vector<int> >& exclusionList, const std::string& kernel,
-                        int forceGroup, bool useNeighborList=true, bool supportsPairList=false);
+                        int forceGroup, bool useNeighborList=true, bool supportsPairList=false, bool supportsExclusionOmission=false);
     /**
      * Add a per-atom parameter that the default interaction kernel may depend on.
      */
@@ -323,6 +339,8 @@ private:
     std::map<int, double> groupCutoff;
     std::map<int, std::string> groupKernelSource;
     double maxCutoff;
+    bool spatialViewReady = false;
+    bool canOmitExcludedPairs = true;
     bool useCutoff, usePeriodic, deviceIsCpu, anyExclusions, usePadding, useNeighborList, forceRebuildNeighborList, useLargeBlocks, isAMD;
     int startTileIndex, startBlockIndex, numBlocks, maxExclusions, numForceThreadBlocks;
     int forceThreadBlockSize, interactingBlocksThreadBlockSize, groupFlags, numBlockSizes;

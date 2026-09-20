@@ -1,16 +1,145 @@
+#ifdef PACKED_EXCLUSIONS
+inline unsigned int lookupExclusions(int block, unsigned int atom,
+        __global const int2* rows, __global const uint2* table, __global const unsigned int* filters) {
+    if (atom >= NUM_ATOMS) return 0xffffffffu;
+    unsigned int hash = atom*0x9e3779b9u;
+    hash ^= hash>>16;
+    if (!(filters[8*block+((hash&255)>>5)] & (1u<<(hash&31)))) return 0;
+    int2 range = rows[block];
+    unsigned int slot = hash&(range.y-1);
+    for (int probe = 0; probe < range.y; probe++) {
+        uint2 entry = table[range.x+slot];
+        if (entry.x == atom+1) return entry.y;
+        if (entry.x == 0) return 0;
+        slot = (slot+1)&(range.y-1);
+    }
+    return 0;
+}
+#endif
+
+// Spatial ordering can create adjacency rows longer than the local cache.
+#ifdef SPATIAL_ATOM_ORDER
+#define EXCLUSION_FOR_X(k) ((k) < MAX_EXCLUSIONS ? exclusionsForX[k] : exclusionIndices[exclusionStart+(k)])
+#else
+#define EXCLUSION_FOR_X(k) exclusionsForX[k]
+#endif
+
 #pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable
 #pragma OPENCL EXTENSION cl_khr_byte_addressable_store : enable
+
+#ifdef SPATIAL_GATHER_BOUNDS
+#define BOUNDS_POS_CONST
+#else
+#define BOUNDS_POS_CONST const
+#endif
 
 /**
  * Find a bounding box for the atoms in each block.
  */
 __kernel void findBlockBounds(int numAtoms, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
-        __global const real4* restrict posq, __global real4* restrict blockCenter, __global real4* restrict blockBoundingBox, __global int* restrict rebuildNeighborList,
-        __global real2* restrict blockSizeRange) {
+        __global BOUNDS_POS_CONST real4* restrict posq, __global real4* restrict blockCenter, __global real4* restrict blockBoundingBox, __global int* restrict rebuildNeighborList,
+        __global real2* restrict blockSizeRange
+#ifdef SPATIAL_GATHER_BOUNDS
+        , __global const real4* restrict originalPosq, __global const int* restrict spatialOrder, __global ulong* restrict spatialForces
+#endif
+#ifdef PACKED_EXCLUSIONS
+        , __global real4* sortedBlockCenter, __global real4* sortedBlockBoundingBox,
+        __global const real4* oldPositions, __global unsigned int* interactionCount, int forceRebuild
+#endif
+        ) {
+#ifdef PACKED_EXCLUSIONS
+    const int lane = get_local_id(0)%8;
+    const int tileLaneBase = get_local_id(0)-lane;
+    const int tilesPerGroup = get_local_size(0)/8;
+    __local volatile real4 lower[64], upper[64];
+    __local volatile real radius[64];
+    bool rebuild = forceRebuild;
+    for (int chunk = get_group_id(0)*tilesPerGroup; chunk < NUM_BLOCKS; chunk += get_num_groups(0)*tilesPerGroup) {
+        int index = chunk+get_local_id(0)/8;
+        int base = index*TILE_SIZE;
+        real4 gathered[4], points[4];
+        for (int j = 0; j < 4; j++) {
+            int atom = base+lane+8*j;
+            gathered[j] = (real4) 0;
+            if (atom < NUM_BLOCKS*TILE_SIZE) {
+                gathered[j] = originalPosq[spatialOrder[atom]];
+                posq[atom] = gathered[j];
+                spatialForces[atom] = spatialForces[atom+NUM_BLOCKS*TILE_SIZE] = spatialForces[atom+2*NUM_BLOCKS*TILE_SIZE] = 0;
+                if (!forceRebuild && atom < numAtoms) {
+                    real4 delta = oldPositions[atom]-gathered[j];
+                    rebuild |= delta.x*delta.x+delta.y*delta.y+delta.z*delta.z > 0.25f*PADDING*PADDING;
+                }
+            }
+        }
+        lower[get_local_id(0)] = gathered[0];
+        SYNC_WARPS;
+        real4 anchor = lower[tileLaneBase];
+        APPLY_PERIODIC_TO_POS(anchor)
+        real4 minPos = anchor, maxPos = anchor;
+        for (int j = 0; j < 4; j++) {
+            real4 point = base+lane+8*j < numAtoms ? gathered[j] : anchor;
+            APPLY_PERIODIC_TO_POS_WITH_CENTER(point, anchor)
+            points[j] = point;
+            minPos = min(minPos, point);
+            maxPos = max(maxPos, point);
+        }
+        SYNC_WARPS;
+        lower[get_local_id(0)] = minPos;
+        upper[get_local_id(0)] = maxPos;
+        SYNC_WARPS;
+        for (int offset = 4; offset > 0; offset /= 2) {
+            real4 lo = lower[tileLaneBase+(lane^offset)];
+            real4 hi = upper[tileLaneBase+(lane^offset)];
+            SYNC_WARPS;
+            minPos = min(minPos, lo);
+            maxPos = max(maxPos, hi);
+            lower[get_local_id(0)] = minPos;
+            upper[get_local_id(0)] = maxPos;
+            SYNC_WARPS;
+        }
+        real4 center = 0.5f*(minPos+maxPos);
+        real r2 = 0;
+        for (int j = 0; j < 4; j++) {
+            real4 delta = points[j]-center;
+            r2 = max(r2, delta.x*delta.x+delta.y*delta.y+delta.z*delta.z);
+        }
+        radius[get_local_id(0)] = r2;
+        SYNC_WARPS;
+        for (int offset = 4; offset > 0; offset /= 2) {
+            real other = radius[tileLaneBase+(lane^offset)];
+            SYNC_WARPS;
+            r2 = max(r2, other);
+            radius[get_local_id(0)] = r2;
+            SYNC_WARPS;
+        }
+        if (lane == 0 && index < NUM_BLOCKS) {
+            real margin = (sizeof(real) == 8 ? 7.105427357601002e-15 : 3.814697265625e-6)*
+                    (1+fabs(minPos.x)+fabs(minPos.y)+fabs(minPos.z)+fabs(maxPos.x)+fabs(maxPos.y)+fabs(maxPos.z));
+            real4 size = 0.5f*(maxPos-minPos)+(real4)(margin, margin, margin, 0);
+            center.w = sqrt(r2)+2*margin;
+            blockCenter[index] = sortedBlockCenter[index] = center;
+            blockBoundingBox[index] = sortedBlockBoundingBox[index] = size;
+        }
+        SYNC_WARPS;
+    }
+    if (rebuild) {
+        atomic_xchg(rebuildNeighborList, 1);
+        atomic_xchg(interactionCount, 0u);
+    }
+#else
     int index = get_global_id(0);
     int base = index*TILE_SIZE;
     real minSize = 1e38, maxSize = 0;
     while (base < numAtoms) {
+#ifdef SPATIAL_GATHER_BOUNDS
+        // This work item owns the whole tile, including padding. No other work
+        // item reads this tile before the next kernel; bounding math is unchanged.
+        for (int i = base; i < base+TILE_SIZE; i++) {
+            real4 gathered = originalPosq[spatialOrder[i]];
+            posq[i] = gathered;
+            spatialForces[i] = spatialForces[i+NUM_BLOCKS*TILE_SIZE] = spatialForces[i+2*NUM_BLOCKS*TILE_SIZE] = 0;
+        }
+#endif
         real4 pos = posq[base];
 #ifdef USE_PERIODIC
         APPLY_PERIODIC_TO_POS(pos)
@@ -65,6 +194,8 @@ __kernel void findBlockBounds(int numAtoms, real4 periodicBoxSize, real4 invPeri
         blockSizeRange[get_group_id(0)] = make_real2(minBuffer[0], maxBuffer[0]);
     if (get_global_id(0) == 0)
         rebuildNeighborList[0] = 0;
+
+#endif
 }
 
 __kernel void computeSortKeys(__global const real4* restrict blockBoundingBox, __global unsigned int* restrict sortedBlocks, __global real2* restrict blockSizeRange, int numSizes) {
@@ -110,6 +241,9 @@ __kernel void sortBoxData(__global const unsigned int* restrict sortedBlocks, __
         real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ
 #endif
         ) {
+#ifdef PACKED_EXCLUSIONS
+    if (!rebuildNeighborList[0]) return;
+#endif
     for (int i = get_global_id(0); i < NUM_BLOCKS; i += get_global_size(0)) {
         unsigned int index = sortedBlocks[i] & BLOCK_INDEX_MASK;
         sortedBlockCenter[i] = blockCenter[index];
@@ -137,6 +271,7 @@ __kernel void sortBoxData(__global const unsigned int* restrict sortedBlocks, __
 #endif
     }
 
+    #ifndef PACKED_EXCLUSIONS
     // Also check whether any atom has moved enough so that we really need to rebuild the neighbor list.
 
     bool rebuild = forceRebuild;
@@ -149,6 +284,7 @@ __kernel void sortBoxData(__global const unsigned int* restrict sortedBlocks, __
         rebuildNeighborList[0] = 1;
         interactionCount[0] = 0;
     }
+    #endif
 }
 
 #if SIMD_WIDTH <= 32
@@ -161,6 +297,10 @@ __kernel void findBlocksWithInteractions(real4 periodicBoxSize, real4 invPeriodi
         __global const real4* restrict sortedBlockCenter, __global const real4* restrict sortedBlockBoundingBox,
         __global const unsigned int* restrict exclusionIndices, __global const unsigned int* restrict exclusionRowIndices, __global real4* restrict oldPositions,
         __global const int* restrict rebuildNeighborList
+#ifdef PACKED_EXCLUSIONS
+        , __global unsigned int* neighborMasks, __global const int2* blockRows,
+        __global const uint2* blockTable, __global const unsigned int* blockFilters
+#endif
 #ifdef USE_LARGE_BLOCKS
         , __global real4* restrict largeBlockCenter, __global real4* restrict largeBlockBoundingBox
 #endif
@@ -175,10 +315,13 @@ __kernel void findBlocksWithInteractions(real4 periodicBoxSize, real4 invPeriodi
     const int warpIndex = get_global_id(0)/32;
     const int warpMask = (1<<indexInWarp)-1;
     __local int workgroupBuffer[BUFFER_SIZE*(GROUP_SIZE/32)];
-    __local int warpExclusions[MAX_EXCLUSIONS*(GROUP_SIZE/32)];
+    __local int warpExclusions[(MAX_EXCLUSIONS > 0 ? MAX_EXCLUSIONS : 1)*(GROUP_SIZE/32)];
     __local real3 posBuffer[GROUP_SIZE];
     __local volatile unsigned int workgroupTileIndex[GROUP_SIZE/32];
     __local bool includeBlockFlags[GROUP_SIZE];
+#ifdef PACKED_EXCLUSIONS
+    __local volatile bool exclusionFlags[GROUP_SIZE];
+#endif
     __local volatile short2 atomCountBuffer[GROUP_SIZE];
     __local int* buffer = workgroupBuffer+BUFFER_SIZE*(warpStart/32);
     __local int* exclusionsForX = warpExclusions+MAX_EXCLUSIONS*(warpStart/32);
@@ -212,16 +355,23 @@ __kernel void findBlocksWithInteractions(real4 periodicBoxSize, real4 invPeriodi
 
         // Load exclusion data for block x.
         
+#ifndef PACKED_EXCLUSIONS
         const int exclusionStart = exclusionRowIndices[x];
         const int exclusionEnd = exclusionRowIndices[x+1];
         const int numExclusions = exclusionEnd-exclusionStart;
-        for (int j = indexInWarp; j < numExclusions; j += 32)
+        for (int j = indexInWarp; j < min(numExclusions, MAX_EXCLUSIONS); j += 32)
             exclusionsForX[j] = exclusionIndices[exclusionStart+j];
+#ifdef SPATIAL_ATOM_ORDER
+        // Each warp loads its own row, including caches larger than 32 entries.
+        SYNC_WARPS;
+#else
         if (MAX_EXCLUSIONS > 32)
             barrier(CLK_LOCAL_MEM_FENCE);
         else
             SYNC_WARPS;
+#endif
         
+#endif
         // Loop over atom blocks to search for neighbors.  The threads in a warp compare block1 against 32
         // other blocks in parallel.
 
@@ -287,8 +437,10 @@ __kernel void findBlocksWithInteractions(real4 periodicBoxSize, real4 invPeriodi
 #endif
                 if (includeBlock2) {
                     int y = sortedBlocks[block2] & BLOCK_INDEX_MASK;
+#ifndef PACKED_EXCLUSIONS
                     for (int k = 0; k < numExclusions; k++)
-                        includeBlock2 &= (exclusionsForX[k] != y);
+                        includeBlock2 &= (EXCLUSION_FOR_X(k) != y);
+#endif
                 }
             }
             
@@ -359,10 +511,27 @@ __kernel void findBlocksWithInteractions(real4 periodicBoxSize, real4 invPeriodi
                         SYNC_WARPS;
                         unsigned int newTileStartIndex = *tileStartIndex;
                         if (newTileStartIndex+tilesToStore <= maxTiles) {
+#ifndef PACKED_EXCLUSIONS
                             if (indexInWarp < tilesToStore)
                                 interactingTiles[newTileStartIndex+indexInWarp] = x;
-                            for (int j = 0; j < tilesToStore; j++)
-                                interactingAtoms[(newTileStartIndex+j)*TILE_SIZE+indexInWarp] = buffer[indexInWarp+j*TILE_SIZE];
+#endif
+                            for (int j = 0; j < tilesToStore; j++) {
+                                int index = (newTileStartIndex+j)*TILE_SIZE+indexInWarp;
+                                int partner = buffer[indexInWarp+j*TILE_SIZE];
+                                interactingAtoms[index] = partner;
+#ifdef PACKED_EXCLUSIONS
+                                unsigned int mask = lookupExclusions(x, partner, blockRows, blockTable, blockFilters);
+                                neighborMasks[index] = mask;
+                                exclusionFlags[get_local_id(0)] = partner < NUM_ATOMS && mask != 0;
+                                SYNC_WARPS;
+                                if (indexInWarp == 0) {
+                                    bool clean = true;
+                                    for (int k = 0; k < TILE_SIZE; k++) clean &= !exclusionFlags[warpStart+k];
+                                    interactingTiles[newTileStartIndex+j] = x | (clean ? 0x80000000u : 0u);
+                                }
+                                SYNC_WARPS;
+#endif
+                            }
                         }
                         if (indexInWarp+TILE_SIZE*tilesToStore < BUFFER_SIZE)
                             buffer[indexInWarp] = buffer[indexInWarp+TILE_SIZE*tilesToStore];
@@ -384,10 +553,27 @@ __kernel void findBlocksWithInteractions(real4 periodicBoxSize, real4 invPeriodi
             SYNC_WARPS;
             unsigned int newTileStartIndex = *tileStartIndex;
             if (newTileStartIndex+tilesToStore <= maxTiles) {
+#ifndef PACKED_EXCLUSIONS
                 if (indexInWarp < tilesToStore)
                     interactingTiles[newTileStartIndex+indexInWarp] = x;
-                for (int j = 0; j < tilesToStore; j++)
-                    interactingAtoms[(newTileStartIndex+j)*TILE_SIZE+indexInWarp] = (indexInWarp+j*TILE_SIZE < neighborsInBuffer ? buffer[indexInWarp+j*TILE_SIZE] : NUM_ATOMS);
+#endif
+                for (int j = 0; j < tilesToStore; j++) {
+                    int index = (newTileStartIndex+j)*TILE_SIZE+indexInWarp;
+                    int partner = (indexInWarp+j*TILE_SIZE < neighborsInBuffer ? buffer[indexInWarp+j*TILE_SIZE] : NUM_ATOMS);
+                    interactingAtoms[index] = partner;
+#ifdef PACKED_EXCLUSIONS
+                    unsigned int mask = lookupExclusions(x, partner, blockRows, blockTable, blockFilters);
+                    neighborMasks[index] = mask;
+                    exclusionFlags[get_local_id(0)] = partner < NUM_ATOMS && mask != 0;
+                    SYNC_WARPS;
+                    if (indexInWarp == 0) {
+                        bool clean = true;
+                        for (int k = 0; k < TILE_SIZE; k++) clean &= !exclusionFlags[warpStart+k];
+                        interactingTiles[newTileStartIndex+j] = x | (clean ? 0x80000000u : 0u);
+                    }
+                    SYNC_WARPS;
+#endif
+                }
             }
         }
     }
@@ -588,7 +774,7 @@ __kernel void findBlocksWithInteractions(real4 periodicBoxSize, real4 invPeriodi
     __local int2 temp[BUFFER_SIZE];
     __local int atoms[BUFFER_SIZE+TILE_SIZE];
     __local real4 posBuffer[TILE_SIZE];
-    __local int exclusionsForX[MAX_EXCLUSIONS];
+    __local int exclusionsForX[MAX_EXCLUSIONS > 0 ? MAX_EXCLUSIONS : 1];
     __local int bufferFull;
     __local int globalIndex;
     __local int numAtoms;
@@ -625,7 +811,7 @@ __kernel void findBlocksWithInteractions(real4 periodicBoxSize, real4 invPeriodi
         const int exclusionStart = exclusionRowIndices[x];
         const int exclusionEnd = exclusionRowIndices[x+1];
         const int numExclusions = exclusionEnd-exclusionStart;
-        for (int j = get_local_id(0); j < numExclusions; j += get_local_size(0))
+        for (int j = get_local_id(0); j < min(numExclusions, MAX_EXCLUSIONS); j += get_local_size(0))
             exclusionsForX[j] = exclusionIndices[exclusionStart+j];
         barrier(CLK_LOCAL_MEM_FENCE);
         
@@ -645,7 +831,7 @@ __kernel void findBlocksWithInteractions(real4 periodicBoxSize, real4 invPeriodi
             delta.z = max((real) 0, fabs(delta.z)-blockSizeX.z-blockSizeY.z);
             bool hasExclusions = false;
             for (int k = 0; k < numExclusions; k++)
-                hasExclusions |= (exclusionsForX[k] == y);
+                hasExclusions |= (EXCLUSION_FOR_X(k) == y);
             if (j < NUM_BLOCKS && delta.x*delta.x+delta.y*delta.y+delta.z*delta.z < PADDED_CUTOFF_SQUARED && !hasExclusions) {
                 // Add this tile to the buffer.
 

@@ -26,8 +26,11 @@
  * -------------------------------------------------------------------------- */
 
 #include "openmm/common/ArrayInterface.h"
+#include "openmm/common/SpatialNonbondedView.h"
 #include "openmm/common/ComputeParameterInfo.h"
+#include "openmm/OpenMMException.h"
 #include <string>
+#include <map>
 #include <vector>
 
 namespace OpenMM {
@@ -55,6 +58,37 @@ namespace OpenMM {
 
 class OPENMM_EXPORT_COMMON NonbondedUtilities {
 public:
+    /** Acquire a coherent full-tile view during an active force evaluation.
+     * Refreshes dirty registered parameters and marks pending force contributions
+     * when includeForces is true. Unsupported/inactive layouts throw explicitly.
+     * Complete producers before this call and consumers on the Context queue.
+     */
+    virtual SpatialNonbondedView getSpatialWorkView(bool includeForces) {
+        throw OpenMMException("No active spatial work view on this backend");
+    }
+    /** Whether the authoritative arrays must retain original atom IDs. */
+    virtual bool getUsesStableAtomOrder() const { return false; }
+    /** Notify spatial views after a producer updates default-kernel particle parameters. */
+    virtual void invalidateSpatialParameters() {}
+    /**
+     * Optional producer interface for spatial parameters.  After
+     * prepareInteractions(), this maps stable atom IDs to spatial indices.
+     * Treat the array as read-only.  A null result means the backend has no
+     * active spatial view.  The array is borrowed until Context reinitialization.
+     */
+    virtual ArrayInterface* getInverseSpatialAtomOrder() { return NULL; }
+    /**
+     * Get the sorted view of a registered default-kernel parameter, or null
+     * when none exists.  After prepareInteractions(), a producer may update
+     * both original[id] and sorted[inverseOrder[id]] in its existing kernel.
+     * It must finish both writes before the nonbonded consumer, on the same
+     * queue or with an explicit dependency.  In that case it need not call
+     * invalidateSpatialParameters() solely for these values.  Original data
+     * must still be maintained: automatic gathers remain valid after sorts
+     * or updates from other producers.  Storage is borrowed. Array objects must not be replaced; resizing
+     * follows the Context registry contract and requires refreshed bindings.  Unsupported backends retain automatic gathering.
+     */
+    virtual ArrayInterface* getReorderedParameterArray(ArrayInterface& original) { return NULL; }
     virtual ~NonbondedUtilities() {
     }
     /**
@@ -69,11 +103,13 @@ public:
      * @param forceGroup     the force group in which the interaction should be calculated
      * @param useNeighborList  specifies whether a neighbor list should be used to optimize this interaction.  This should
      *                         be viewed as only a suggestion.  Even when it is false, a neighbor list may be used anyway.
+     * @param supportsExclusionOmission true only if excluded pairs require no calculation in this kernel.
+     *        Every consumer must opt in before a backend may omit them during neighbor construction.
      * @param supportsPairList specifies whether this interaction can work with a neighbor list that uses a separate pair list
      */
     virtual void addInteraction(bool usesCutoff, bool usesPeriodic, bool usesExclusions, double cutoffDistance,
                                 const std::vector<std::vector<int> >& exclusionList, const std::string& kernel,
-                                int forceGroup, bool useNeighborList=true, bool supportsPairList=false) = 0;
+                                int forceGroup, bool useNeighborList=true, bool supportsPairList=false, bool supportsExclusionOmission=false) = 0;
     /**
      * Add a per-atom parameter that the default interaction kernel may depend on.
      */
