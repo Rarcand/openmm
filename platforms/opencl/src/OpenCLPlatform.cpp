@@ -55,12 +55,6 @@ extern "C" OPENMM_EXPORT_COMMON void registerPlatforms() {
 }
 #endif
 
-namespace {
-const map<string, string> spatialDefaults = {
-    {"AtomReordering", "auto"}
-};
-}
-
 OpenCLPlatform::OpenCLPlatform() {
     deprecatedPropertyReplacements["OpenCLDeviceIndex"] = OpenCLDeviceIndex();
     deprecatedPropertyReplacements["OpenCLDeviceName"] = OpenCLDeviceName();
@@ -274,8 +268,6 @@ void OpenCLPlatform::contextCreated(ContextImpl& context, const map<string, stri
     context.setPlatformData(new PlatformData(context.getSystem(), &context, platformPropValue, devicePropValue, precisionPropValue, cpuPmePropValue,
             pmeStreamPropValue, threads, NULL));
     PlatformData* data = reinterpret_cast<PlatformData*>(context.getPlatformData());
-    for (const auto& option : spatialDefaults)
-        data->propertyValues[option.first] = option.second;
     bool supportedLayout = true;
     for (auto cc : data->contexts)
         supportedLayout = supportedLayout && cc->getSIMDWidth() == 32 && cc->getDevice().getInfo<CL_DEVICE_TYPE>() != CL_DEVICE_TYPE_CPU;
@@ -294,8 +286,6 @@ void OpenCLPlatform::linkedContextCreated(ContextImpl& context, ContextImpl& ori
     context.setPlatformData(new PlatformData(context.getSystem(), &context, platformPropValue, devicePropValue, precisionPropValue, cpuPmePropValue,
             pmeStreamPropValue, threads, &originalContext));
     PlatformData* data = reinterpret_cast<PlatformData*>(context.getPlatformData());
-    for (const auto& option : spatialDefaults)
-        data->propertyValues[option.first] = platform.getPropertyValue(originalContext.getOwner(), option.first);
     bool supportedLayout = true;
     for (auto cc : data->contexts)
         supportedLayout = supportedLayout && cc->getSIMDWidth() == 32 && cc->getDevice().getInfo<CL_DEVICE_TYPE>() != CL_DEVICE_TYPE_CPU;

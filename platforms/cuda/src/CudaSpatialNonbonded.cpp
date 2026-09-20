@@ -40,14 +40,13 @@ public:
 
 CudaSpatialNonbonded::CudaSpatialNonbonded(CudaContext& context, CudaNonbondedUtilities& nonbonded) :
         cc(context), nb(nonbonded), reorderRequested(true), forcesPending(false), reorderCount(0), parameterArrays(nullptr) {
-    const auto& properties = cc.getPlatformData().propertyValues;
     indexedPositions = false;
     identityOrdering = false;
-    directForces = properties.at("AtomReorderingForceAccumulation") == "direct";
+    directForces = false;
     boundsGather = true;
     boundsTileLanes = 8;
     fused = !directForces;
-    packedExclusions = properties.at("AtomReorderingPackedExclusions") == "true";
+    packedExclusions = false;
     exclusionFilter = true;
     reorderInterval = 250;
 }
@@ -64,7 +63,6 @@ void CudaSpatialNonbonded::initialize(const System& system) {
     if (identityOrdering) {
         directForces = true;
         fused = false;
-        cc.getPlatformData().propertyValues["AtomReorderingForceAccumulation"] = "direct";
     }
     if (identityOrdering && (nb.useNeighborList || !nb.canUseIndexedPositions))
         throw OpenMMException("Identity ordering requires exhaustive standard nonbonded execution");

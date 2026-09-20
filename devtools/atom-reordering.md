@@ -21,7 +21,14 @@ ctest --test-dir build --output-on-failure
 
 On systems with multiple OpenCL implementations, use the existing `OPENCL_TEST_PLATFORM_INDEX` and `OPENCL_TEST_DEVICE_INDEX` CMake test settings to select the hardware. These do not tune the architecture.
 
-The spatial-work tests exercise registered arrays, resizing, independent force contributions, parameter updates, checkpoints, reinitialization, centroid geometry across periodic recentering, nested DPD integrator detection, and rejection of incompatible packed views. The OpenCL NonbondedForce suite includes a box-change regression where coordinates do not move but the neighbor list must be invalidated.
+The spatial-work tests exercise registered arrays, resizing, independent force contributions, parameter updates, checkpoints, reinitialization, centroid geometry across periodic recentering, nested and linked DPD integrator selection, and rejection of incompatible packed views. The OpenCL NonbondedForce suite includes a box-change regression where coordinates do not move but the neighbor list must be invalidated.
+
+With this build installed into the active Python environment, the existing benchmark can exercise the default path without architecture settings:
+
+```sh
+python examples/benchmarks/benchmark.py --platform CUDA --test pme --precision mixed --seconds 30
+python examples/benchmarks/benchmark.py --platform OpenCL --test pme --precision mixed --seconds 30
+```
 
 Performance must be compared with an unmodified build of the same upstream commit on the same OS/device/precision. The older experimental measurements at `0da03998` do not qualify this upstream-based revision. Passing force tests does not establish bitwise agreement between different spatial summation orders.
 

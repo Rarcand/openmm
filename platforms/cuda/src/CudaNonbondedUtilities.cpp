@@ -82,8 +82,7 @@ CudaNonbondedUtilities::CudaNonbondedUtilities(CudaContext& context) : context(c
 
     useLargeBlocks = (context.getNumAtoms() > 90000);
     setKernelSource(CudaKernelSources::nonbonded);
-    string mode = context.getPlatformData().propertyValues[CudaPlatform::CudaAtomReordering()];
-    if (mode != "baseline")
+    if (context.getPlatformData().propertyValues.at("AtomReorderingStatus") == "spatial")
         spatial.reset(new CudaSpatialNonbonded(context, *this));
 }
 

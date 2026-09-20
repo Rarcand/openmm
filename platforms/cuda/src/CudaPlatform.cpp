@@ -42,13 +42,6 @@
 using namespace OpenMM;
 using namespace std;
 
-// Internal execution settings. Context creation does not expose tuning controls.
-static const map<string, string> spatialDefaults = {
-    {"AtomReorderingForceAccumulation", "buffered"},
-    {"AtomReorderingPackedExclusions", "false"},
-    {"AtomReorderingExclusionFilter", "none"}
-};
-
 #define CHECK_RESULT(result, prefix) \
     if (result != CUDA_SUCCESS) { \
         std::stringstream m; \
@@ -270,8 +263,6 @@ CudaPlatform::PlatformData::PlatformData(ContextImpl* context, const System& sys
             const string& cpuPmeProperty, const string& tempProperty, const string& pmeStreamProperty, const string& deterministicForcesProperty,
             int numThreads, ContextImpl* originalContext) : context(context), removeCM(false), stepCount(0), computeForceCount(0), time(0.0),
                 hasInitializedContexts(false), threads(numThreads) {
-    propertyValues[CudaPlatform::CudaAtomReordering()] = "auto";
-    propertyValues.insert(spatialDefaults.begin(), spatialDefaults.end());
     bool blocking = (blockingProperty == "true");
     vector<string> devices;
     size_t searchPos = 0, nextPos;

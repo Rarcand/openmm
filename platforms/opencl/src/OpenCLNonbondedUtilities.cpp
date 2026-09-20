@@ -306,7 +306,7 @@ void OpenCLNonbondedUtilities::initialize(const System& system) {
 }
 
 void OpenCLNonbondedUtilities::configureSpatial() {
-    if (context.getPlatformData().propertyValues.at("AtomReordering") != "baseline")
+    if (context.getPlatformData().propertyValues.at("AtomReorderingStatus") == "spatial")
         spatial.reset(new OpenCLSpatialNonbonded(context, *this));
 }
 

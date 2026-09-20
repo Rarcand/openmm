@@ -255,6 +255,13 @@ public:
             centroidContext.setPositions({Vec3(3.9,1,1), Vec3(4.1,1,1), Vec3(4.2,1,1), Vec3(4.4,1,1)});
             auto before = centroidContext.getState(State::Energy|State::Forces, false, 2);
             require(abs(before.getPotentialEnergy()-.09) < 1e-5, "Incorrect centroid bond energy");
+            // A linked context selects eligibility for its own integrator.
+            DPDIntegrator linkedIntegrator(300, 1, 1, .001);
+            unique_ptr<Context> linked(getContextImpl(centroidContext).createLinkedContext(centroidSystem, linkedIntegrator));
+            linked->setPositions({Vec3(3.9,1,1), Vec3(4.1,1,1), Vec3(4.2,1,1), Vec3(4.4,1,1)});
+            auto& linkedCC = device(getContextImpl(*linked));
+            require(!linkedCC.getNonbondedUtilities().getUsesStableAtomOrder(), "Linked DPD context did not select legacy execution");
+            require(isfinite(linked->getState(State::Energy).getPotentialEnergy()), "Invalid linked context energy");
             auto& centroidCC = device(getContextImpl(centroidContext));
             require(centroidCC.getNonbondedUtilities().getUsesStableAtomOrder(), "Centroid probe did not select spatial execution");
             centroidCC.forceReorder();

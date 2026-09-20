@@ -48,11 +48,6 @@ public:
     }
     double getSpeed() const;
     bool supportsDoublePrecision() const;
-    /** Internal key for the resolved spatial-view support policy. */
-    static const std::string& CudaAtomReordering() {
-        static const std::string key = "AtomReordering";
-        return key;
-    }
     const std::string& getPropertyValue(const Context& context, const std::string& property) const;
     void setPropertyValue(Context& context, const std::string& property, const std::string& value) const;
     std::vector<std::map<std::string, std::string> > getDevices(const std::map<std::string, std::string>& filters={}) const;

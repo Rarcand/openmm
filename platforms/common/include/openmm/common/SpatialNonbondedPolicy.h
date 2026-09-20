@@ -25,7 +25,7 @@
 
 namespace OpenMM {
 /** Shared eligibility policy. Unknown independent neighbor consumers use legacy
- * execution in auto mode until explicitly migrated. This is not a claim of
+ * execution until explicitly migrated. This is not a claim of
  * spatial support for every Force implementation. */
 class SpatialNonbondedPolicy {
 public:
@@ -79,20 +79,11 @@ public:
     }
     static void configure(std::map<std::string, std::string>& properties, const System& system,
             int devices, bool supportedDevice = true, const Integrator* integrator = nullptr) {
-        const std::string requested = properties.at("AtomReordering");
-        if (requested == "baseline") {
-            properties["AtomReorderingStatus"] = "baseline";
-            return;
-        }
         std::string reason = devices != 1 ? "spatial execution currently requires one device" :
                 (!supportedDevice ? "spatial execution requires a supported GPU layout" : unsupportedReason(system));
         if (reason.empty() && integrator != nullptr && usesIndependentNeighborList(*integrator))
             reason = "DPD integrators require the original neighbor-list layout";
-        if (!reason.empty() && requested != "auto")
-            throw OpenMMException(reason);
         properties["AtomReorderingStatus"] = reason.empty() ? "spatial" : "baseline: "+reason;
-        if (requested == "auto")
-            properties["AtomReordering"] = reason.empty() ? "inverse" : "baseline";
     }
 };
 }
